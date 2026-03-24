@@ -15,8 +15,12 @@
 #ifndef TENT_ENDPOINT_H
 #define TENT_ENDPOINT_H
 
+#include <memory>
 #include <queue>
+#include <unordered_set>
+#include <vector>
 
+#include "tent/common/concurrent/ticket_lock.h"
 #include "context.h"
 
 namespace mooncake {
@@ -170,6 +174,7 @@ class RdmaEndPoint {
 
     std::vector<ibv_qp*> qp_list_;
     std::vector<BoundedSliceQueue> slice_queue_;
+    std::unique_ptr<TicketLock[]> slice_queue_locks_;
     WrDepthBlock* wr_depth_list_;
     volatile int inflight_slices_;
     uint32_t padding_[7];
