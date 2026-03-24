@@ -69,6 +69,7 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     inflight_slices_ = 0;
     endpoints_count_ = endpoints_count;
     qp_list_.resize(params_->qp_mul_factor);
+    slice_queue_locks_ = std::make_unique<TicketLock[]>(params_->qp_mul_factor);
     wr_depth_list_ = new WrDepthBlock[params_->qp_mul_factor];
 
     for (int i = 0; i < params_->qp_mul_factor; ++i) {
@@ -207,6 +208,7 @@ int RdmaEndPoint::deconstruct() {
     }
     qp_list_.clear();
     slice_queue_.clear();
+    slice_queue_locks_.reset();
     delete[] wr_depth_list_;
     wr_depth_list_ = nullptr;
     peer_server_name_.clear();
@@ -512,11 +514,13 @@ static ibv_wr_opcode getOpCode(RdmaSlice* slice) {
 
 int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
                                int qp_index) {
-    // RWSpinlock::ReadGuard guard(lock_);  // TODO performance issue
     const static int kSgeEntries = 1;
-    if (status_ != EP_READY) return 0;
+    if (qp_list_.empty()) return 0;
     if (qp_index < 0) qp_index = 0;
     qp_index %= qp_list_.size();
+    // Serialize post-send bookkeeping with reset/ack on the same QP queue.
+    std::lock_guard<TicketLock> queue_guard(slice_queue_locks_[qp_index]);
+    if (status_ != EP_READY) return 0;
     auto cq = context_->cq(qp_index % context_->cqCount());
     int wr_count =
         std::min(cq->maxCqe() - cq->getQuota(),
@@ -598,6 +602,7 @@ int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
 void RdmaEndPoint::resetInflightSlices() {
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
         auto& queue = slice_queue_[qp_index];
+        std::lock_guard<TicketLock> queue_guard(slice_queue_locks_[qp_index]);
         while (!queue.empty()) {
             auto current = queue.pop();
             updateSliceStatus(current, TransferStatusEnum::CANCELED);
@@ -607,7 +612,9 @@ void RdmaEndPoint::resetInflightSlices() {
 
 size_t RdmaEndPoint::acknowledge(RdmaSlice* slice, TransferStatusEnum status) {
     auto qp_index = slice->qp_index;
+    if (qp_index < 0 || qp_index >= (int)slice_queue_.size()) return 0;
     auto& queue = slice_queue_[qp_index];
+    std::lock_guard<TicketLock> queue_guard(slice_queue_locks_[qp_index]);
     if (!queue.contains(slice)) return 0;
     int num_entries = 0;
     RdmaSlice* current = nullptr;
