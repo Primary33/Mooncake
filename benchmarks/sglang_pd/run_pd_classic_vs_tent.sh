@@ -13,7 +13,7 @@ SGLANG_ROUTER_MODULE=${SGLANG_ROUTER_MODULE:-sglang_router.launch_router}
 SGLANG_BENCH_MODULE=${SGLANG_BENCH_MODULE:-sglang.bench_serving}
 
 MODEL_PATH=${MODEL_PATH:-/mnt/data/models/Qwen3-8B}
-TENT_CONF=${TENT_CONF:-/home/mxl/tent-sglang-pd.json}
+TENT_CONF=${TENT_CONF:-/home/mxl/tent-sglang-pd-gpu01-near-nics.json}
 
 BIND_HOST=${BIND_HOST:-127.0.0.1}
 PREFILL_PORT=${PREFILL_PORT:-31000}
