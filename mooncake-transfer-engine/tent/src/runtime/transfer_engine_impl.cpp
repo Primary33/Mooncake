@@ -61,6 +61,62 @@ struct Batch {
     std::vector<SubmitHook> submit_hooks;
 };
 
+struct PreservedTentConfigOverrides {
+    std::optional<std::string> metadata_type;
+    std::optional<std::string> metadata_servers;
+    std::optional<std::string> local_segment_name;
+    std::optional<std::string> rpc_server_hostname;
+    std::optional<int> rpc_server_port;
+};
+
+template <typename T>
+std::optional<T> captureExplicitConfigValue(const Config& config,
+                                            const std::string& key,
+                                            const T& default_value) {
+    if (!config.contains(key)) {
+        return std::nullopt;
+    }
+    return config.get<T>(key, default_value);
+}
+
+PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
+    const Config& config) {
+    PreservedTentConfigOverrides preserved;
+    preserved.metadata_type =
+        captureExplicitConfigValue(config, "metadata_type", std::string());
+    preserved.metadata_servers =
+        captureExplicitConfigValue(config, "metadata_servers", std::string());
+    preserved.local_segment_name =
+        captureExplicitConfigValue(config, "local_segment_name", std::string());
+    preserved.rpc_server_hostname = captureExplicitConfigValue(
+        config, "rpc_server_hostname", std::string());
+    preserved.rpc_server_port =
+        captureExplicitConfigValue(config, "rpc_server_port", 0);
+    return preserved;
+}
+
+template <typename T>
+void restoreExplicitConfigValue(Config& config, const std::string& key,
+                                const std::optional<T>& value) {
+    if (value.has_value()) {
+        config.set(key, *value);
+    }
+}
+
+void restoreExplicitTransferEngineConfig(
+    Config& config, const PreservedTentConfigOverrides& preserved) {
+    restoreExplicitConfigValue(config, "metadata_type",
+                               preserved.metadata_type);
+    restoreExplicitConfigValue(config, "metadata_servers",
+                               preserved.metadata_servers);
+    restoreExplicitConfigValue(config, "local_segment_name",
+                               preserved.local_segment_name);
+    restoreExplicitConfigValue(config, "rpc_server_hostname",
+                               preserved.rpc_server_hostname);
+    restoreExplicitConfigValue(config, "rpc_server_port",
+                               preserved.rpc_server_port);
+}
+
 TransferEngineImpl::TransferEngineImpl()
     : conf_(std::make_shared<Config>()), available_(false) {
     ConfigHelper().loadFromEnv(*conf_);
@@ -75,8 +131,11 @@ TransferEngineImpl::TransferEngineImpl()
 
 TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf)
     : conf_(conf), available_(false) {
-    // Load environment variables - they should override config file settings
+    auto preserved = captureExplicitTransferEngineConfig(*conf_);
+    // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
+    // explicit metadata identity intact.
     ConfigHelper().loadFromEnv(*conf_);
+    restoreExplicitTransferEngineConfig(*conf_, preserved);
     auto status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
