@@ -34,6 +34,9 @@ COMMON_SERVER_ARGS=${COMMON_SERVER_ARGS:---mem-fraction-static 0.6 --tp-size 1 -
 PREFILL_SERVER_ARGS=${PREFILL_SERVER_ARGS:-}
 DECODE_SERVER_ARGS=${DECODE_SERVER_ARGS:-}
 ROUTER_ARGS=${ROUTER_ARGS:---mini-lb}
+HICACHE_ENABLE=${HICACHE_ENABLE:-1}
+HICACHE_STORAGE_BACKEND=${HICACHE_STORAGE_BACKEND:-mooncake}
+HICACHE_ARGS=${HICACHE_ARGS:-}
 
 COMMON_SERVER_ENV=${COMMON_SERVER_ENV:-SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=60}
 ROUTER_ENV=${ROUTER_ENV:-}
@@ -96,6 +99,9 @@ Important env vars:
   MODEL_PATH                 Model path
   TENT_CONF                  TENT config file path
   COMMON_SERVER_ARGS         Extra args shared by prefill/decode
+  HICACHE_ENABLE             1 to enable HiCache on prefill/decode, default: 1
+  HICACHE_STORAGE_BACKEND    HiCache L3 backend, default: mooncake
+  HICACHE_ARGS               Extra HiCache args shared by prefill/decode
   PD_IB_DEVICE               Shared disaggregation NIC used by both sides
   PREFILL_IB_DEVICE          Optional override for prefill NIC
   DECODE_IB_DEVICE           Optional override for decode NIC
@@ -350,6 +356,13 @@ start_sglang_server() {
   if [[ -n "${ib_device}" ]]; then
     cmd+=(--disaggregation-ib-device "${ib_device}")
   fi
+  if [[ "${HICACHE_ENABLE}" == "1" ]]; then
+    cmd+=(--enable-hierarchical-cache)
+    if [[ -n "${HICACHE_STORAGE_BACKEND}" ]]; then
+      cmd+=(--hicache-storage-backend "${HICACHE_STORAGE_BACKEND}")
+    fi
+    append_shell_words cmd "${HICACHE_ARGS}"
+  fi
   append_shell_words cmd "${COMMON_SERVER_ARGS}"
   append_shell_words cmd "${role_args}"
 
@@ -502,6 +515,9 @@ BOOTSTRAP_PORT=${BOOTSTRAP_PORT}
 PREFILL_GPU=${PREFILL_GPU}
 DECODE_GPU=${DECODE_GPU}
 COMMON_SERVER_ARGS=${COMMON_SERVER_ARGS}
+HICACHE_ENABLE=${HICACHE_ENABLE}
+HICACHE_STORAGE_BACKEND=${HICACHE_STORAGE_BACKEND}
+HICACHE_ARGS=${HICACHE_ARGS}
 PD_IB_DEVICE=${PD_IB_DEVICE}
 PREFILL_IB_DEVICE=${PREFILL_IB_DEVICE}
 DECODE_IB_DEVICE=${DECODE_IB_DEVICE}
