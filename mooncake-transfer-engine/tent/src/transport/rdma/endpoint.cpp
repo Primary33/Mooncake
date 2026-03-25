@@ -168,6 +168,11 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
 }
 
 int RdmaEndPoint::deconstruct() {
+    RWSpinlock::WriteGuard guard(lock_);
+    return deconstructUnlocked();
+}
+
+int RdmaEndPoint::deconstructUnlocked() {
     if (status_ == EP_UNINIT) return 0;
     status_ = EP_RESET;
     resetInflightSlices();
@@ -461,7 +466,7 @@ int RdmaEndPoint::resetUnlocked() {
             context_->verbs_.ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
         if (ret) {
             PLOG(ERROR) << "ibv_modify_qp(RESET)";
-            deconstruct();
+            deconstructUnlocked();
             return -1;
         }
         cancelQuota(i, wr_depth_list_[i].value);
@@ -515,6 +520,7 @@ static ibv_wr_opcode getOpCode(RdmaSlice* slice) {
 int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
                                int qp_index) {
     const static int kSgeEntries = 1;
+    RWSpinlock::ReadGuard guard(lock_);
     if (qp_list_.empty()) return 0;
     if (qp_index < 0) qp_index = 0;
     qp_index %= qp_list_.size();
@@ -611,6 +617,7 @@ void RdmaEndPoint::resetInflightSlices() {
 }
 
 size_t RdmaEndPoint::acknowledge(RdmaSlice* slice, TransferStatusEnum status) {
+    RWSpinlock::ReadGuard guard(lock_);
     auto qp_index = slice->qp_index;
     if (qp_index < 0 || qp_index >= (int)slice_queue_.size()) return 0;
     auto& queue = slice_queue_[qp_index];

@@ -161,6 +161,9 @@ class RdmaEndPoint {
     void cancelQuota(int qp_index, int num_entries);
 
    private:
+    // Caller must hold lock_ in write mode.
+    int deconstructUnlocked();
+
     void resetInflightSlices();
 
     void postNotifyRecv(size_t idx);
