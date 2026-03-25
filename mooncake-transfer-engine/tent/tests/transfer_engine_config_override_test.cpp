@@ -18,31 +18,18 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <optional>
+#include <memory>
 #include <string>
 
 #include "tent/common/config.h"
+#include "tent/runtime/transfer_engine_impl.h"
 
 namespace mooncake {
 namespace tent {
 
-// Mirror the internal declarations from transfer_engine_impl.cpp without
-// exporting them in a public header.
-struct PreservedTentConfigOverrides {
-    std::optional<std::string> metadata_type;
-    std::optional<std::string> metadata_servers;
-    std::optional<std::string> local_segment_name;
-    std::optional<std::string> rpc_server_hostname;
-    std::optional<int> rpc_server_port;
-};
-
-PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
-    const Config& config);
-
-void restoreExplicitTransferEngineConfig(
-    Config& config, const PreservedTentConfigOverrides& preserved);
-
 namespace {
+
+constexpr char kInvalidHostname[] = "256.256.256.256";
 
 class EnvVarGuard {
    public:
@@ -95,7 +82,7 @@ class TempConfigFile {
 };
 
 TEST(TransferEngineConfigOverrideTest,
-     ExplicitMetadataIdentitySurvivesMcTentConfReload) {
+     ExplicitStringPortSurvivesMcTentConfReloadThroughConstructor) {
     TempConfigFile conf_file(R"({
         "metadata_type": "p2p",
         "metadata_servers": "127.0.0.1:2379",
@@ -106,50 +93,53 @@ TEST(TransferEngineConfigOverrideTest,
     })");
     EnvVarGuard guard("MC_TENT_CONF", conf_file.path());
 
-    Config config;
-    config.set("metadata_type", "http");
-    config.set("metadata_servers", "127.0.0.1:18080/metadata");
-    config.set("local_segment_name", "store-segment-A");
-    config.set("rpc_server_hostname", "192.168.10.24");
-    config.set("rpc_server_port", 26001);
+    auto config = std::make_shared<Config>();
+    config->set("metadata_type", "http");
+    config->set("metadata_servers", "127.0.0.1:18080/metadata");
+    config->set("local_segment_name", "store-segment-A");
+    config->set("rpc_server_hostname", kInvalidHostname);
+    config->set("rpc_server_port", "26001");
 
-    auto preserved = captureExplicitTransferEngineConfig(config);
-    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
-    restoreExplicitTransferEngineConfig(config, preserved);
+    // Use an invalid hostname so construction stops after config merge.
+    TransferEngineImpl engine(config);
 
-    EXPECT_EQ(config.get("metadata_type", ""), "http");
-    EXPECT_EQ(config.get("metadata_servers", ""),
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(config->get("metadata_type", ""), "http");
+    EXPECT_EQ(config->get("metadata_servers", ""),
               "127.0.0.1:18080/metadata");
-    EXPECT_EQ(config.get("local_segment_name", ""), "store-segment-A");
-    EXPECT_EQ(config.get("rpc_server_hostname", ""), "192.168.10.24");
-    EXPECT_EQ(config.get("rpc_server_port", 0), 26001);
+    EXPECT_EQ(config->get("local_segment_name", ""), "store-segment-A");
+    EXPECT_EQ(config->get("rpc_server_hostname", ""), kInvalidHostname);
+    EXPECT_EQ(config->get("rpc_server_port", ""), "26001");
+    EXPECT_EQ(engine.getRpcServerAddress(), kInvalidHostname);
+    EXPECT_EQ(engine.getRpcServerPort(), 26001);
 
-    EXPECT_EQ(config.get("log_level", ""), "warning");
-    EXPECT_FALSE(config.get("merge_requests", true));
+    EXPECT_EQ(config->get("log_level", ""), "warning");
+    EXPECT_FALSE(config->get("merge_requests", true));
 }
 
 TEST(TransferEngineConfigOverrideTest,
-     MissingExplicitKeysContinueUsingMcTentConfValues) {
+     MissingExplicitKeysContinueUsingMcTentConfValuesThroughConstructor) {
     TempConfigFile conf_file(R"({
         "metadata_type": "p2p",
         "metadata_servers": "127.0.0.1:2379",
-        "rpc_server_hostname": "10.0.0.9",
+        "rpc_server_hostname": "256.256.256.256",
         "rpc_server_port": 15012
     })");
     EnvVarGuard guard("MC_TENT_CONF", conf_file.path());
 
-    Config config;
-    config.set("local_segment_name", "store-segment-B");
+    auto config = std::make_shared<Config>();
+    config->set("local_segment_name", "store-segment-B");
 
-    auto preserved = captureExplicitTransferEngineConfig(config);
-    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
-    restoreExplicitTransferEngineConfig(config, preserved);
+    TransferEngineImpl engine(config);
 
-    EXPECT_EQ(config.get("metadata_type", ""), "p2p");
-    EXPECT_EQ(config.get("metadata_servers", ""), "127.0.0.1:2379");
-    EXPECT_EQ(config.get("rpc_server_hostname", ""), "10.0.0.9");
-    EXPECT_EQ(config.get("rpc_server_port", 0), 15012);
-    EXPECT_EQ(config.get("local_segment_name", ""), "store-segment-B");
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(config->get("metadata_type", ""), "p2p");
+    EXPECT_EQ(config->get("metadata_servers", ""), "127.0.0.1:2379");
+    EXPECT_EQ(config->get("rpc_server_hostname", ""), kInvalidHostname);
+    EXPECT_EQ(config->get("rpc_server_port", 0), 15012);
+    EXPECT_EQ(config->get("local_segment_name", ""), "store-segment-B");
+    EXPECT_EQ(engine.getRpcServerAddress(), kInvalidHostname);
+    EXPECT_EQ(engine.getRpcServerPort(), 15012);
 }
 
 }  // namespace

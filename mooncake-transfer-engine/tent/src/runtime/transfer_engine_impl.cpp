@@ -66,7 +66,10 @@ struct PreservedTentConfigOverrides {
     std::optional<std::string> metadata_servers;
     std::optional<std::string> local_segment_name;
     std::optional<std::string> rpc_server_hostname;
-    std::optional<int> rpc_server_port;
+    struct IntLikeValue {
+        std::optional<int> int_value;
+        std::optional<std::string> string_value;
+    } rpc_server_port;
 };
 
 template <typename T>
@@ -77,6 +80,64 @@ std::optional<T> captureExplicitConfigValue(const Config& config,
         return std::nullopt;
     }
     return config.get<T>(key, default_value);
+}
+
+std::optional<int> tryParseConfigIntString(const std::string& value) {
+    try {
+        size_t parsed_chars = 0;
+        int parsed_value = std::stoi(value, &parsed_chars);
+        if (parsed_chars == value.size()) {
+            return parsed_value;
+        }
+    } catch (...) {
+    }
+    return std::nullopt;
+}
+
+PreservedTentConfigOverrides::IntLikeValue captureExplicitIntLikeConfigValue(
+    const Config& config, const std::string& key) {
+    PreservedTentConfigOverrides::IntLikeValue preserved;
+    if (!config.contains(key)) {
+        return preserved;
+    }
+
+    constexpr int kMissingIntValue = std::numeric_limits<int>::min();
+    int int_value = config.get<int>(key, kMissingIntValue);
+    if (int_value != kMissingIntValue) {
+        preserved.int_value = int_value;
+        return preserved;
+    }
+
+    constexpr const char* kMissingStringValue =
+        "__mooncake_missing_int_like_config__";
+    std::string string_value = config.get(key, kMissingStringValue);
+    if (string_value != kMissingStringValue) {
+        preserved.string_value = string_value;
+    }
+    return preserved;
+}
+
+int getConfigIntLikeValue(const Config& config, const std::string& key,
+                          int default_value) {
+    if (!config.contains(key)) {
+        return default_value;
+    }
+
+    constexpr int kMissingIntValue = std::numeric_limits<int>::min();
+    int int_value = config.get<int>(key, kMissingIntValue);
+    if (int_value != kMissingIntValue) {
+        return int_value;
+    }
+
+    constexpr const char* kMissingStringValue =
+        "__mooncake_missing_int_like_config__";
+    std::string string_value = config.get(key, kMissingStringValue);
+    if (string_value == kMissingStringValue) {
+        return default_value;
+    }
+
+    auto parsed_value = tryParseConfigIntString(string_value);
+    return parsed_value.value_or(default_value);
 }
 
 PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
@@ -91,7 +152,7 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
     preserved.rpc_server_hostname = captureExplicitConfigValue(
         config, "rpc_server_hostname", std::string());
     preserved.rpc_server_port =
-        captureExplicitConfigValue(config, "rpc_server_port", 0);
+        captureExplicitIntLikeConfigValue(config, "rpc_server_port");
     return preserved;
 }
 
@@ -100,6 +161,16 @@ void restoreExplicitConfigValue(Config& config, const std::string& key,
                                 const std::optional<T>& value) {
     if (value.has_value()) {
         config.set(key, *value);
+    }
+}
+
+void restoreExplicitConfigValue(
+    Config& config, const std::string& key,
+    const PreservedTentConfigOverrides::IntLikeValue& value) {
+    if (value.int_value.has_value()) {
+        config.set(key, *value.int_value);
+    } else if (value.string_value.has_value()) {
+        config.set(key, *value.string_value);
     }
 }
 
@@ -217,7 +288,8 @@ Status TransferEngineImpl::construct() {
     setLogLevel(conf_->get("log_level", "info"));
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
-    port_ = conf_->get("rpc_server_port", 0);
+    port_ = static_cast<uint16_t>(
+        getConfigIntLikeValue(*conf_, "rpc_server_port", 0));
     merge_requests_ = conf_->get("merge_requests", true);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
