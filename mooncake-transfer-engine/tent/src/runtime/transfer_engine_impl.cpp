@@ -66,10 +66,7 @@ struct PreservedTentConfigOverrides {
     std::optional<std::string> metadata_servers;
     std::optional<std::string> local_segment_name;
     std::optional<std::string> rpc_server_hostname;
-    struct IntLikeValue {
-        std::optional<int> int_value;
-        std::optional<std::string> string_value;
-    } rpc_server_port;
+    std::optional<json> rpc_server_port;
 };
 
 template <typename T>
@@ -82,10 +79,10 @@ std::optional<T> captureExplicitConfigValue(const Config& config,
     return config.get<T>(key, default_value);
 }
 
-std::optional<int> tryParseConfigIntString(const std::string& value) {
+std::optional<long long> tryParseConfigIntString(const std::string& value) {
     try {
         size_t parsed_chars = 0;
-        int parsed_value = std::stoi(value, &parsed_chars);
+        long long parsed_value = std::stoll(value, &parsed_chars);
         if (parsed_chars == value.size()) {
             return parsed_value;
         }
@@ -94,50 +91,49 @@ std::optional<int> tryParseConfigIntString(const std::string& value) {
     return std::nullopt;
 }
 
-PreservedTentConfigOverrides::IntLikeValue captureExplicitIntLikeConfigValue(
-    const Config& config, const std::string& key) {
-    PreservedTentConfigOverrides::IntLikeValue preserved;
-    if (!config.contains(key)) {
-        return preserved;
+Status validateRpcServerPortValue(long long value, const std::string& source,
+                                  uint16_t& port) {
+    constexpr long long kMinPort = 0;
+    constexpr long long kMaxPort = std::numeric_limits<uint16_t>::max();
+    if (value < kMinPort || value > kMaxPort) {
+        return Status::InvalidArgument("Invalid rpc_server_port '" + source +
+                                       "', expected value in range [0, " +
+                                       std::to_string(kMaxPort) + "]" +
+                                       LOC_MARK);
     }
 
-    constexpr int kMissingIntValue = std::numeric_limits<int>::min();
-    int int_value = config.get<int>(key, kMissingIntValue);
-    if (int_value != kMissingIntValue) {
-        preserved.int_value = int_value;
-        return preserved;
-    }
-
-    constexpr const char* kMissingStringValue =
-        "__mooncake_missing_int_like_config__";
-    std::string string_value = config.get(key, kMissingStringValue);
-    if (string_value != kMissingStringValue) {
-        preserved.string_value = string_value;
-    }
-    return preserved;
+    port = static_cast<uint16_t>(value);
+    return Status::OK();
 }
 
-int getConfigIntLikeValue(const Config& config, const std::string& key,
-                          int default_value) {
-    if (!config.contains(key)) {
-        return default_value;
+Status getRpcServerPortFromConfig(const Config& config, uint16_t default_value,
+                                  uint16_t& port) {
+    constexpr const char* kKey = "rpc_server_port";
+    if (!config.contains(kKey)) {
+        port = default_value;
+        return Status::OK();
     }
 
-    constexpr int kMissingIntValue = std::numeric_limits<int>::min();
-    int int_value = config.get<int>(key, kMissingIntValue);
-    if (int_value != kMissingIntValue) {
-        return int_value;
+    json raw_value = config.get<json>(kKey, json());
+    if (raw_value.is_number_integer() || raw_value.is_number_unsigned()) {
+        long long numeric_value = raw_value.get<long long>();
+        return validateRpcServerPortValue(numeric_value,
+                                          std::to_string(numeric_value), port);
     }
 
-    constexpr const char* kMissingStringValue =
-        "__mooncake_missing_int_like_config__";
-    std::string string_value = config.get(key, kMissingStringValue);
-    if (string_value == kMissingStringValue) {
-        return default_value;
+    if (raw_value.is_string()) {
+        auto string_value = raw_value.get<std::string>();
+        auto parsed_value = tryParseConfigIntString(string_value);
+        if (!parsed_value.has_value()) {
+            return Status::InvalidArgument(
+                "Invalid rpc_server_port '" + string_value +
+                "', expected integer in range [0, 65535]" LOC_MARK);
+        }
+        return validateRpcServerPortValue(*parsed_value, string_value, port);
     }
 
-    auto parsed_value = tryParseConfigIntString(string_value);
-    return parsed_value.value_or(default_value);
+    return Status::InvalidArgument(
+        "rpc_server_port must be an integer or integer string" LOC_MARK);
 }
 
 PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
@@ -152,7 +148,7 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
     preserved.rpc_server_hostname = captureExplicitConfigValue(
         config, "rpc_server_hostname", std::string());
     preserved.rpc_server_port =
-        captureExplicitIntLikeConfigValue(config, "rpc_server_port");
+        captureExplicitConfigValue(config, "rpc_server_port", json());
     return preserved;
 }
 
@@ -161,16 +157,6 @@ void restoreExplicitConfigValue(Config& config, const std::string& key,
                                 const std::optional<T>& value) {
     if (value.has_value()) {
         config.set(key, *value);
-    }
-}
-
-void restoreExplicitConfigValue(
-    Config& config, const std::string& key,
-    const PreservedTentConfigOverrides::IntLikeValue& value) {
-    if (value.int_value.has_value()) {
-        config.set(key, *value.int_value);
-    } else if (value.string_value.has_value()) {
-        config.set(key, *value.string_value);
     }
 }
 
@@ -189,7 +175,11 @@ void restoreExplicitTransferEngineConfig(
 }
 
 TransferEngineImpl::TransferEngineImpl()
-    : conf_(std::make_shared<Config>()), available_(false) {
+    : conf_(std::make_shared<Config>()),
+      available_(false),
+      port_(0),
+      ipv6_(false),
+      merge_requests_(true) {
     ConfigHelper().loadFromEnv(*conf_);
     auto status = construct();
     if (!status.ok()) {
@@ -201,7 +191,11 @@ TransferEngineImpl::TransferEngineImpl()
 }
 
 TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf)
-    : conf_(conf), available_(false) {
+    : conf_(conf),
+      available_(false),
+      port_(0),
+      ipv6_(false),
+      merge_requests_(true) {
     auto preserved = captureExplicitTransferEngineConfig(*conf_);
     // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
     // explicit metadata identity intact.
@@ -288,8 +282,7 @@ Status TransferEngineImpl::construct() {
     setLogLevel(conf_->get("log_level", "info"));
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
-    port_ = static_cast<uint16_t>(
-        getConfigIntLikeValue(*conf_, "rpc_server_port", 0));
+    CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
     merge_requests_ = conf_->get("merge_requests", true);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
