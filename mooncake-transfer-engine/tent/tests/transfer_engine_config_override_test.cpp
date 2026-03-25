@@ -71,12 +71,11 @@ class EnvVarGuard {
 class TempConfigFile {
    public:
     explicit TempConfigFile(const std::string& content) {
-        auto unique_name = "tent-config-" +
-                           std::to_string(
-                               std::chrono::steady_clock::now()
-                                   .time_since_epoch()
-                                   .count()) +
-                           ".json";
+        auto unique_name =
+            "tent-config-" +
+            std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()) +
+            ".json";
         path_ = std::filesystem::temp_directory_path() / unique_name;
         std::ofstream ofs(path_);
         ofs << content;
@@ -244,9 +243,9 @@ class TestHttpMetadataServer {
         asio::io_context io_context;
         asio::ip::tcp::socket socket(io_context);
         std::error_code ec;
-        socket.connect(asio::ip::tcp::endpoint(
-                           asio::ip::address_v4::loopback(), port_),
-                       ec);
+        socket.connect(
+            asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), port_),
+            ec);
         return !ec;
     }
 
@@ -360,8 +359,8 @@ TEST(TransferEngineConfigOverrideTest,
     })");
     EnvVarGuard guard("MC_TENT_CONF", conf_file.path());
 
-    for (const auto& invalid_port : {std::string("70000"),
-                                     std::string("abc")}) {
+    for (const auto& invalid_port :
+         {std::string("70000"), std::string("abc")}) {
         SCOPED_TRACE(invalid_port);
         auto config = std::make_shared<Config>();
         config->set("rpc_server_hostname", kLoopbackHostname);
