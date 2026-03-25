@@ -66,7 +66,7 @@ struct PreservedTentConfigOverrides {
     std::optional<std::string> metadata_servers;
     std::optional<std::string> local_segment_name;
     std::optional<std::string> rpc_server_hostname;
-    std::optional<int> rpc_server_port;
+    std::optional<json> rpc_server_port;
 };
 
 template <typename T>
@@ -77,6 +77,63 @@ std::optional<T> captureExplicitConfigValue(const Config& config,
         return std::nullopt;
     }
     return config.get<T>(key, default_value);
+}
+
+std::optional<long long> tryParseConfigIntString(const std::string& value) {
+    try {
+        size_t parsed_chars = 0;
+        long long parsed_value = std::stoll(value, &parsed_chars);
+        if (parsed_chars == value.size()) {
+            return parsed_value;
+        }
+    } catch (...) {
+    }
+    return std::nullopt;
+}
+
+Status validateRpcServerPortValue(long long value, const std::string& source,
+                                  uint16_t& port) {
+    constexpr long long kMinPort = 0;
+    constexpr long long kMaxPort = std::numeric_limits<uint16_t>::max();
+    if (value < kMinPort || value > kMaxPort) {
+        return Status::InvalidArgument("Invalid rpc_server_port '" + source +
+                                       "', expected value in range [0, " +
+                                       std::to_string(kMaxPort) + "]" +
+                                       LOC_MARK);
+    }
+
+    port = static_cast<uint16_t>(value);
+    return Status::OK();
+}
+
+Status getRpcServerPortFromConfig(const Config& config, uint16_t default_value,
+                                  uint16_t& port) {
+    constexpr const char* kKey = "rpc_server_port";
+    if (!config.contains(kKey)) {
+        port = default_value;
+        return Status::OK();
+    }
+
+    json raw_value = config.get<json>(kKey, json());
+    if (raw_value.is_number_integer() || raw_value.is_number_unsigned()) {
+        long long numeric_value = raw_value.get<long long>();
+        return validateRpcServerPortValue(numeric_value,
+                                          std::to_string(numeric_value), port);
+    }
+
+    if (raw_value.is_string()) {
+        auto string_value = raw_value.get<std::string>();
+        auto parsed_value = tryParseConfigIntString(string_value);
+        if (!parsed_value.has_value()) {
+            return Status::InvalidArgument(
+                "Invalid rpc_server_port '" + string_value +
+                "', expected integer in range [0, 65535]" LOC_MARK);
+        }
+        return validateRpcServerPortValue(*parsed_value, string_value, port);
+    }
+
+    return Status::InvalidArgument(
+        "rpc_server_port must be an integer or integer string" LOC_MARK);
 }
 
 PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
@@ -91,7 +148,7 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
     preserved.rpc_server_hostname = captureExplicitConfigValue(
         config, "rpc_server_hostname", std::string());
     preserved.rpc_server_port =
-        captureExplicitConfigValue(config, "rpc_server_port", 0);
+        captureExplicitConfigValue(config, "rpc_server_port", json());
     return preserved;
 }
 
@@ -118,7 +175,11 @@ void restoreExplicitTransferEngineConfig(
 }
 
 TransferEngineImpl::TransferEngineImpl()
-    : conf_(std::make_shared<Config>()), available_(false) {
+    : conf_(std::make_shared<Config>()),
+      available_(false),
+      port_(0),
+      ipv6_(false),
+      merge_requests_(true) {
     ConfigHelper().loadFromEnv(*conf_);
     auto status = construct();
     if (!status.ok()) {
@@ -130,7 +191,11 @@ TransferEngineImpl::TransferEngineImpl()
 }
 
 TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf)
-    : conf_(conf), available_(false) {
+    : conf_(conf),
+      available_(false),
+      port_(0),
+      ipv6_(false),
+      merge_requests_(true) {
     auto preserved = captureExplicitTransferEngineConfig(*conf_);
     // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
     // explicit metadata identity intact.
@@ -217,7 +282,7 @@ Status TransferEngineImpl::construct() {
     setLogLevel(conf_->get("log_level", "info"));
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
-    port_ = conf_->get("rpc_server_port", 0);
+    CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
     merge_requests_ = conf_->get("merge_requests", true);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));

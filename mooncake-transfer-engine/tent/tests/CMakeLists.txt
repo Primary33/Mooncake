@@ -23,6 +23,10 @@ add_executable(transfer_engine_config_override_test
                transfer_engine_config_override_test.cpp)
 target_link_libraries(transfer_engine_config_override_test
                       PRIVATE tent gtest gtest_main)
+if (TARGET asio_shared)
+    target_link_libraries(transfer_engine_config_override_test
+                          PRIVATE asio_shared)
+endif()
 target_include_directories(transfer_engine_config_override_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME transfer_engine_config_override_test
