@@ -227,8 +227,7 @@ void RdmaEndPoint::drainNotifyOpsLocked() {
     notify_send_cv_.notify_all();
 
     std::unique_lock<std::mutex> ops_lock(notify_ops_mutex_);
-    notify_ops_cv_.wait(
-        ops_lock, [this] { return notify_ops_inflight_ == 0; });
+    notify_ops_cv_.wait(ops_lock, [this] { return notify_ops_inflight_ == 0; });
     ops_lock.unlock();
 
     std::lock_guard<std::mutex> send_lock(notify_send_mutex_);
