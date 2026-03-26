@@ -620,12 +620,12 @@ int RdmaTransport::processNotifyCompletions() {
             }
 
             // Find endpoint by QP number
-            RdmaEndPoint* endpoint = nullptr;
+            std::shared_ptr<RdmaEndPoint> endpoint;
             {
                 RWSpinlock::ReadGuard guard(notify_endpoint_map_lock_);
                 auto it = notify_qp_to_endpoint_.find(wc[i].qp_num);
                 if (it != notify_qp_to_endpoint_.end()) {
-                    endpoint = it->second;
+                    endpoint = it->second.lock();
                 }
             }
 
@@ -648,7 +648,8 @@ int RdmaTransport::processNotifyCompletions() {
     return total_completions;
 }
 
-void RdmaTransport::registerNotifyQp(uint32_t qp_num, RdmaEndPoint* endpoint) {
+void RdmaTransport::registerNotifyQp(
+    uint32_t qp_num, const std::shared_ptr<RdmaEndPoint>& endpoint) {
     RWSpinlock::WriteGuard guard(notify_endpoint_map_lock_);
     notify_qp_to_endpoint_[qp_num] = endpoint;
 }

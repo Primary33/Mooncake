@@ -15,6 +15,10 @@
 #ifndef TENT_ENDPOINT_H
 #define TENT_ENDPOINT_H
 
+#include <atomic>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <queue>
 #include <unordered_set>
 #include <vector>
@@ -23,7 +27,7 @@
 
 namespace mooncake {
 namespace tent {
-class RdmaEndPoint {
+class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     struct WrDepthBlock {
         volatile int value;
         uint64_t padding[7];
@@ -161,8 +165,14 @@ class RdmaEndPoint {
    private:
     // Caller must hold lock_ in write mode.
     int deconstructUnlocked();
+    // Caller must hold lock_ in write mode.
+    void drainNotifyOpsLocked();
 
     void resetInflightSlices();
+
+    bool beginNotifySend();
+    bool beginNotifyRecv();
+    void endNotifyOp();
 
     void postNotifyRecv(size_t idx);
     void repostAllNotifyRecvs();
@@ -201,6 +211,10 @@ class RdmaEndPoint {
     std::condition_variable notify_send_cv_;
     int notify_pending_count_ = 0;    // Number of pending sends
     uint64_t notify_send_wr_id_ = 0;  // Circular counter for wr_id
+    std::mutex notify_ops_mutex_;
+    std::condition_variable notify_ops_cv_;
+    size_t notify_ops_inflight_ = 0;
+    std::atomic<bool> notify_tearing_down_{false};
     bool notify_connected_ = false;
 };
 }  // namespace tent

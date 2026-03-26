@@ -174,6 +174,7 @@ int RdmaEndPoint::deconstruct() {
 int RdmaEndPoint::deconstructUnlocked() {
     if (status_ == EP_UNINIT) return 0;
     status_ = EP_RESET;
+    drainNotifyOpsLocked();
     resetInflightSlices();
     peer_qp_num_list_.clear();
 
@@ -218,6 +219,52 @@ int RdmaEndPoint::deconstructUnlocked() {
     peer_nic_name_.clear();
     status_ = EP_UNINIT;
     return 0;
+}
+
+void RdmaEndPoint::drainNotifyOpsLocked() {
+    notify_tearing_down_.store(true, std::memory_order_release);
+    notify_connected_ = false;
+    notify_send_cv_.notify_all();
+
+    std::unique_lock<std::mutex> ops_lock(notify_ops_mutex_);
+    notify_ops_cv_.wait(
+        ops_lock, [this] { return notify_ops_inflight_ == 0; });
+    ops_lock.unlock();
+
+    std::lock_guard<std::mutex> send_lock(notify_send_mutex_);
+    notify_pending_count_ = 0;
+}
+
+bool RdmaEndPoint::beginNotifySend() {
+    RWSpinlock::ReadGuard guard(lock_);
+    if (notify_tearing_down_.load(std::memory_order_acquire) ||
+        status_ != EP_READY || !notify_qp_ || !notify_connected_ ||
+        !notify_send_mr_ || notify_send_buffer_.empty()) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> inflight_guard(notify_ops_mutex_);
+    ++notify_ops_inflight_;
+    return true;
+}
+
+bool RdmaEndPoint::beginNotifyRecv() {
+    RWSpinlock::ReadGuard guard(lock_);
+    if (notify_tearing_down_.load(std::memory_order_acquire) || !notify_qp_ ||
+        notify_recv_buffers_.empty() || notify_recv_mrs_.empty()) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> inflight_guard(notify_ops_mutex_);
+    ++notify_ops_inflight_;
+    return true;
+}
+
+void RdmaEndPoint::endNotifyOp() {
+    std::lock_guard<std::mutex> inflight_guard(notify_ops_mutex_);
+    if (notify_ops_inflight_ == 0) return;
+    --notify_ops_inflight_;
+    if (notify_ops_inflight_ == 0) notify_ops_cv_.notify_all();
 }
 
 Status RdmaEndPoint::connect(const std::string& peer_server_name,
@@ -337,7 +384,9 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
             } else {
                 notify_connected_ = true;
                 repostAllNotifyRecvs();
-                context_->transport_.registerNotifyQp(notify_qp_->qp_num, this);
+                notify_tearing_down_.store(false, std::memory_order_release);
+                context_->transport_.registerNotifyQp(notify_qp_->qp_num,
+                                                      shared_from_this());
             }
         }
     }
@@ -425,7 +474,9 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
         } else {
             notify_connected_ = true;
             repostAllNotifyRecvs();
-            context_->transport_.registerNotifyQp(notify_qp_->qp_num, this);
+            notify_tearing_down_.store(false, std::memory_order_release);
+            context_->transport_.registerNotifyQp(notify_qp_->qp_num,
+                                                  shared_from_this());
         }
     }
 
@@ -440,6 +491,7 @@ int RdmaEndPoint::reset() {
 int RdmaEndPoint::resetUnlocked() {
     if (status_ != EP_READY) return 0;
     status_ = EP_RESET;
+    drainNotifyOpsLocked();
     peer_qp_num_list_.clear();
     resetInflightSlices();
 
@@ -449,11 +501,6 @@ int RdmaEndPoint::resetUnlocked() {
         // completions (flush errors) from the CQ between reset and reconnect.
         // Unregistering here would cause "unknown QP" warnings.
         notify_connected_ = false;
-        {
-            std::lock_guard<std::mutex> lock(notify_send_mutex_);
-            notify_pending_count_ = 0;
-        }
-        notify_send_cv_.notify_all();
     }
 
     ibv_qp_attr attr;
@@ -870,16 +917,23 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
 
 bool RdmaEndPoint::sendNotification(const std::string& name,
                                     const std::string& msg) {
-    if (!notify_qp_ || !notify_connected_) {
+    if (!beginNotifySend()) {
         LOG(ERROR) << "Notification QP not connected";
         return false;
     }
+    auto end_notify = [this](RdmaEndPoint*) { endNotifyOp(); };
+    std::unique_ptr<RdmaEndPoint, decltype(end_notify)> notify_op_guard(
+        this, end_notify);
 
     // Flow control: wait for pending sends to complete
     std::unique_lock<std::mutex> lock(notify_send_mutex_);
     notify_send_cv_.wait(lock, [this] {
-        return notify_pending_count_ < kNotifyMaxPendingSends;
+        return notify_tearing_down_.load(std::memory_order_acquire) ||
+               notify_pending_count_ < kNotifyMaxPendingSends;
     });
+    if (notify_tearing_down_.load(std::memory_order_acquire)) {
+        return false;
+    }
 
     // Pick the next send slot — flow control guarantees this slot's previous
     // DMA has completed (at most kNotifyMaxPendingSends-1 in-flight).
@@ -936,6 +990,13 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
 }
 
 bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
+    if (!beginNotifyRecv()) {
+        return false;
+    }
+    auto end_notify = [this](RdmaEndPoint*) { endNotifyOp(); };
+    std::unique_ptr<RdmaEndPoint, decltype(end_notify)> notify_op_guard(
+        this, end_notify);
+
     if (buffer_idx >= notify_recv_buffers_.size()) {
         LOG(ERROR) << "Invalid recv buffer index: " << buffer_idx;
         return false;
@@ -943,7 +1004,9 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
 
     // Silent retry for byte_len == 0
     if (byte_len == 0) {
-        postNotifyRecv(buffer_idx);
+        if (!notify_tearing_down_.load(std::memory_order_acquire)) {
+            postNotifyRecv(buffer_idx);
+        }
         return false;
     }
 
@@ -953,14 +1016,18 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     // Deserialize: [name_len(4)][name][msg_len(4)][msg]
     if (len < 8) {
         LOG(ERROR) << "Invalid notification message size: " << len;
-        postNotifyRecv(buffer_idx);
+        if (!notify_tearing_down_.load(std::memory_order_acquire)) {
+            postNotifyRecv(buffer_idx);
+        }
         return false;
     }
 
     uint32_t name_len = *reinterpret_cast<uint32_t*>(data);
     if (name_len > len - 8) {
         LOG(ERROR) << "Invalid notification message format (name too long)";
-        postNotifyRecv(buffer_idx);
+        if (!notify_tearing_down_.load(std::memory_order_acquire)) {
+            postNotifyRecv(buffer_idx);
+        }
         return false;
     }
 
@@ -968,7 +1035,9 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     uint32_t msg_len = *reinterpret_cast<uint32_t*>(data + 4 + name_len);
     if (msg_len > len - 8 - name_len) {
         LOG(ERROR) << "Invalid notification message format (msg too long)";
-        postNotifyRecv(buffer_idx);
+        if (!notify_tearing_down_.load(std::memory_order_acquire)) {
+            postNotifyRecv(buffer_idx);
+        }
         return false;
     }
 
@@ -978,7 +1047,9 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     context_->transport_.addNotificationToQueue(name, msg);
 
     // Repost recv buffer
-    postNotifyRecv(buffer_idx);
+    if (!notify_tearing_down_.load(std::memory_order_acquire)) {
+        postNotifyRecv(buffer_idx);
+    }
     return true;
 }
 
