@@ -2,7 +2,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <cstring>
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
@@ -855,6 +857,212 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
         client_buffer_allocator_->deallocate(
             target_batched_slices[keys[i]][0].ptr, test_data_list[i].size());
     }
+}
+
+TEST_F(ClientIntegrationTest, DefaultBatchGetIsolatesInvalidRemoteObject) {
+    constexpr size_t kSize = 256;
+    const std::vector<std::string> keys{
+        "batch_remote_invalid", "batch_remote_valid_a", "batch_local_valid_a",
+        "batch_local_valid_b",  "batch_remote_valid_b", "batch_missing_key"};
+    const size_t allocation_size = kSize * (keys.size() + 1);
+    auto* buffer =
+        static_cast<char*>(client_buffer_allocator_->allocate(allocation_size));
+    ASSERT_NE(buffer, nullptr);
+    auto release = [allocation_size](void* ptr) {
+        client_buffer_allocator_->deallocate(ptr, allocation_size);
+    };
+    std::unique_ptr<void, decltype(release)> owner(buffer, release);
+    std::unordered_map<std::string, std::vector<Slice>> destinations;
+    for (size_t i = 0; i + 1 < keys.size(); ++i) {
+        std::memset(buffer, 'A' + i, kSize);
+        std::vector<Slice> source{{buffer, kSize}};
+        ReplicateConfig config;
+        config.preferred_segment =
+            (i == 2 || i == 3) ? "localhost:17813" : "localhost:17812";
+        ASSERT_TRUE(test_client_->Put(keys[i], source, config));
+        auto query = test_client_->Query(keys[i]);
+        ASSERT_TRUE(query);
+        ASSERT_EQ(query->replicas[0]
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  (i == 2 || i == 3)
+                      ? test_client_->GetTransportEndpoint()
+                      : segment_provider_client_->GetTransportEndpoint());
+        auto* destination = buffer + (i + 1) * kSize;
+        std::memset(destination, '?', kSize);
+        destinations[keys[i]] = {{destination, i == 0 ? kSize - 1 : kSize}};
+    }
+
+    const auto results = test_client_->BatchGet(keys, destinations);
+    ASSERT_EQ(results.size(), keys.size());
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(results[0].error(), ErrorCode::TRANSFER_FAIL);
+    EXPECT_TRUE(std::all_of(buffer + kSize, buffer + 2 * kSize,
+                            [](char value) { return value == '?'; }));
+    for (size_t i = 1; i + 1 < keys.size(); ++i) {
+        ASSERT_TRUE(results[i]) << toString(results[i].error());
+        const auto* destination = buffer + (i + 1) * kSize;
+        EXPECT_TRUE(std::all_of(
+            destination, destination + kSize, [i](unsigned char value) {
+                return value == static_cast<unsigned char>('A' + i);
+            }));
+    }
+    ASSERT_FALSE(results.back());
+    EXPECT_EQ(results.back().error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    // A third client has no local replicas: both endpoints must now form
+    // independent remote batches, retaining the original key order.
+    auto reader = CreateClient("localhost:17814");
+    ASSERT_NE(reader, nullptr);
+    ASSERT_TRUE(reader->RegisterLocalMemory(buffer, allocation_size, "cpu:0",
+                                            false, false));
+    std::memset(buffer + kSize, '?', allocation_size - kSize);
+    const auto remote_results = reader->BatchGet(keys, destinations);
+    ASSERT_EQ(remote_results.size(), keys.size());
+    ASSERT_FALSE(remote_results[0]);
+    EXPECT_EQ(remote_results[0].error(), ErrorCode::TRANSFER_FAIL);
+    for (size_t i = 1; i + 1 < keys.size(); ++i) {
+        ASSERT_TRUE(remote_results[i]);
+        const auto* destination = buffer + (i + 1) * kSize;
+        EXPECT_TRUE(std::all_of(
+            destination, destination + kSize, [i](unsigned char value) {
+                return value == static_cast<unsigned char>('A' + i);
+            }));
+    }
+    ASSERT_FALSE(remote_results.back());
+    EXPECT_EQ(remote_results.back().error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_TRUE(reader->unregisterLocalMemory(buffer, false));
+    reader.reset();
+    for (size_t i = 0; i + 1 < keys.size(); ++i)
+        EXPECT_TRUE(test_client_->Remove(keys[i], true));
+}
+
+TEST_F(ClientIntegrationTest, DefaultBatchGetMixedSizesAcrossBatchBoundaries) {
+    // Exercise the object-count limit, byte limit and both sides of the
+    // small-object cutoff, with failures in both submission paths.
+    std::vector<size_t> sizes(67, 4096);
+    sizes.insert(sizes.end(),
+                 {65535, 65536, 65537, 256 * 1024, 4 * 1024 * 1024});
+    sizes.insert(sizes.end(), 25, 48 * 1024);
+    sizes.insert(sizes.end(), {4096, 4096});
+    constexpr size_t kInvalidSmall = 63;
+    constexpr size_t kInvalidLarge = 68;
+    const size_t source_size = *std::max_element(sizes.begin(), sizes.end());
+    size_t allocation_size = source_size;
+    for (size_t size : sizes) allocation_size += size;
+    auto* buffer =
+        static_cast<char*>(client_buffer_allocator_->allocate(allocation_size));
+    ASSERT_NE(buffer, nullptr);
+    auto release = [allocation_size](void* ptr) {
+        client_buffer_allocator_->deallocate(ptr, allocation_size);
+    };
+    std::unique_ptr<void, decltype(release)> owner(buffer, release);
+
+    // A separate reader forces reads from both providers through the remote
+    // path, even though the test hosts every client in one process.
+    auto reader = CreateClient("localhost:17814");
+    ASSERT_NE(reader, nullptr);
+    ASSERT_TRUE(reader->RegisterLocalMemory(buffer, allocation_size, "cpu:0",
+                                            false, false));
+    std::vector<std::string> keys;
+    std::vector<char*> targets;
+    std::unordered_map<std::string, std::vector<Slice>> destinations;
+    size_t offset = source_size;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        keys.push_back("batch_mixed_size_" + std::to_string(i));
+        std::memset(buffer, static_cast<int>(i + 1), sizes[i]);
+        std::vector<Slice> source{{buffer, sizes[i]}};
+        ReplicateConfig config;
+        config.preferred_segment =
+            i + 2 < sizes.size() ? "localhost:17812" : "localhost:17813";
+        ASSERT_TRUE(test_client_->Put(keys.back(), source, config));
+        targets.push_back(buffer + offset);
+        std::memset(targets.back(), '?', sizes[i]);
+        const bool invalid = i == kInvalidSmall || i == kInvalidLarge;
+        // Use multiple destination slices as well as different object sizes.
+        const size_t first = sizes[i] / 2;
+        destinations[keys.back()] = {
+            {targets.back(), first},
+            {targets.back() + first, sizes[i] - first - (invalid ? 1 : 0)}};
+        offset += sizes[i];
+    }
+    ASSERT_EQ(offset, allocation_size);
+
+    // Repeat to cover releasing completed batches and reusing segment handles.
+    for (int round = 0; round < 2; ++round) {
+        const auto results = reader->BatchGet(keys, destinations);
+        ASSERT_EQ(results.size(), keys.size());
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            if (i == kInvalidSmall || i == kInvalidLarge) {
+                ASSERT_FALSE(results[i]) << "object " << i;
+                EXPECT_EQ(results[i].error(), ErrorCode::TRANSFER_FAIL);
+                EXPECT_TRUE(
+                    std::all_of(targets[i], targets[i] + sizes[i],
+                                [](char value) { return value == '?'; }));
+            } else {
+                ASSERT_TRUE(results[i]) << "object " << i;
+                EXPECT_TRUE(std::all_of(
+                    targets[i], targets[i] + sizes[i],
+                    [i](unsigned char value) {
+                        return value == static_cast<unsigned char>(i + 1);
+                    }))
+                    << "object " << i;
+            }
+            std::memset(targets[i], '?', sizes[i]);
+        }
+    }
+    EXPECT_TRUE(reader->unregisterLocalMemory(buffer, false));
+    reader.reset();
+    for (const auto& key : keys) EXPECT_TRUE(test_client_->Remove(key, true));
+}
+
+TEST_F(ClientIntegrationTest, DefaultBatchGetIsolatesChecksumFailure) {
+    if (!Environ::Get().GetStoreChecksumEnabled()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    const std::vector<std::string> keys{"batch_checksum_bad",
+                                        "batch_checksum_ok"};
+    const std::string value = "remote batch checksum regression";
+    const size_t allocation_size = value.size() * 3;
+    auto* buffer =
+        static_cast<char*>(client_buffer_allocator_->allocate(allocation_size));
+    ASSERT_NE(buffer, nullptr);
+    auto release = [allocation_size](void* ptr) {
+        client_buffer_allocator_->deallocate(ptr, allocation_size);
+    };
+    std::unique_ptr<void, decltype(release)> owner(buffer, release);
+    std::memcpy(buffer, value.data(), value.size());
+    ReplicateConfig config;
+    config.preferred_segment = "localhost:17812";
+    std::unordered_map<std::string, std::vector<Slice>> destinations;
+    std::vector<QueryResult> queries;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::vector<Slice> source{{buffer, value.size()}};
+        ASSERT_TRUE(test_client_->Put(keys[i], source, config));
+        auto query = test_client_->Query(keys[i]);
+        ASSERT_TRUE(query);
+        ASSERT_TRUE(query->object_checksum);
+        queries.push_back(std::move(*query));
+        destinations[keys[i]] = {
+            {buffer + (i + 1) * value.size(), value.size()}};
+    }
+    // Both providers live in this process, so corrupt the stored bytes
+    // directly.
+    auto* stored =
+        reinterpret_cast<char*>(queries[0]
+                                    .replicas[0]
+                                    .get_memory_descriptor()
+                                    .buffer_descriptor.buffer_address_);
+    stored[0] ^= 1;
+    const auto results = test_client_->BatchGet(keys, queries, destinations);
+    stored[0] ^= 1;
+    ASSERT_EQ(results.size(), keys.size());
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(results[0].error(), ErrorCode::CHECKSUM_MISMATCH);
+    ASSERT_TRUE(results[1]);
+    EXPECT_EQ(
+        std::memcmp(buffer + 2 * value.size(), value.data(), value.size()), 0);
+    for (const auto& key : keys) EXPECT_TRUE(test_client_->Remove(key, true));
 }
 
 TEST_F(ClientIntegrationTest, BatchGetChecksLeasesWithPreferredNode) {

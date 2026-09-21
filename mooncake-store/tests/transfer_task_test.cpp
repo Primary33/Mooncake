@@ -5,6 +5,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
@@ -515,6 +517,224 @@ TEST_F(TransferTaskTest, RemoteTransferWaitCompletesCorrectly) {
     }
     EXPECT_EQ(client.unregisterLocalMemory(local.data()), 0);
     EXPECT_EQ(server.unregisterLocalMemory(remote.data()), 0);
+}
+
+class BatchReadTest : public TransferTaskTest {
+   protected:
+    static constexpr size_t kObjectSize = 256;
+    static constexpr size_t kObjectCount = 4;
+
+    void SetUp() override {
+        TransferTaskTest::SetUp();
+        source_.resize(kObjectSize * kObjectCount);
+        destination_.resize(source_.size(), '?');
+        for (size_t i = 0; i < kObjectCount; ++i)
+            std::fill_n(source_.data() + i * kObjectSize, kObjectSize, 'A' + i);
+        client_ = std::make_unique<TransferEngine>(false);
+        server_ = std::make_unique<TransferEngine>(false);
+        ASSERT_EQ(client_->init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"),
+                  0);
+        ASSERT_EQ(server_->init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"),
+                  0);
+        if (!client_->isUsingTent()) {
+            ASSERT_NE(client_->installTransport("tcp", nullptr), nullptr);
+            ASSERT_NE(server_->installTransport("tcp", nullptr), nullptr);
+        }
+        ASSERT_EQ(client_->registerLocalMemory(destination_.data(),
+                                               destination_.size()),
+                  0);
+        destination_registered_ = true;
+        ASSERT_EQ(server_->registerLocalMemory(source_.data(), source_.size()),
+                  0);
+        source_registered_ = true;
+        submitter_ = std::make_unique<TransferSubmitter>(
+            *client_, backend_, client_->getLocalIpAndPort());
+    }
+
+    void TearDown() override {
+        submitter_.reset();
+        if (destination_registered_) {
+            EXPECT_EQ(client_->unregisterLocalMemory(destination_.data()), 0);
+        }
+        if (source_registered_) {
+            EXPECT_EQ(server_->unregisterLocalMemory(source_.data()), 0);
+        }
+        client_.reset();
+        server_.reset();
+        TransferTaskTest::TearDown();
+    }
+
+    std::vector<Replica::Descriptor> Replicas() const {
+        std::vector<Replica::Descriptor> replicas;
+        for (size_t i = 0; i < kObjectCount; ++i) {
+            MemoryDescriptor memory;
+            memory.buffer_descriptor.buffer_address_ =
+                reinterpret_cast<uintptr_t>(source_.data() + i * kObjectSize);
+            memory.buffer_descriptor.size_ = kObjectSize;
+            memory.buffer_descriptor.transport_endpoint_ =
+                server_->getLocalIpAndPort();
+            Replica::Descriptor replica;
+            replica.descriptor_variant = memory;
+            replica.status = ReplicaStatus::COMPLETE;
+            replicas.push_back(std::move(replica));
+        }
+        return replicas;
+    }
+
+    std::vector<std::vector<Slice>> Destinations() {
+        std::vector<std::vector<Slice>> slices;
+        for (size_t i = 0; i < kObjectCount; ++i)
+            slices.push_back(
+                {{destination_.data() + i * kObjectSize, kObjectSize}});
+        return slices;
+    }
+
+    ScopedEnvVar tent_conf_{"MC_TENT_CONF", nullptr};
+    std::vector<char> source_;
+    std::vector<char> destination_;
+    std::unique_ptr<TransferEngine> client_;
+    std::unique_ptr<TransferEngine> server_;
+    std::shared_ptr<StorageBackend> backend_;
+    std::unique_ptr<TransferSubmitter> submitter_;
+    bool destination_registered_ = false;
+    bool source_registered_ = false;
+};
+
+TEST_F(BatchReadTest, InvalidObjectsDoNotPreventValidReads) {
+    auto slices = Destinations();
+    slices[0][0].size -= 1;
+    slices[1][0].ptr = nullptr;
+    auto operation = submitter_->submitBatchRead(Replicas(), slices);
+    EXPECT_EQ(operation.wait(),
+              (std::vector<ErrorCode>{ErrorCode::TRANSFER_FAIL,
+                                      ErrorCode::TRANSFER_FAIL, ErrorCode::OK,
+                                      ErrorCode::OK}));
+    EXPECT_TRUE(std::all_of(destination_.begin(),
+                            destination_.begin() + 2 * kObjectSize,
+                            [](char value) { return value == '?'; }));
+    EXPECT_TRUE(std::equal(destination_.begin() + 2 * kObjectSize,
+                           destination_.end(),
+                           source_.begin() + 2 * kObjectSize));
+}
+
+TEST_F(BatchReadTest, MultipleSlicesAndZeroLengthFragments) {
+    auto slices = Destinations();
+    for (size_t i = 0; i < slices.size(); ++i) {
+        auto* buffer = destination_.data() + i * kObjectSize;
+        slices[i] = {
+            {buffer, 17}, {nullptr, 0}, {buffer + 17, kObjectSize - 17}};
+    }
+    auto operation = submitter_->submitBatchRead(Replicas(), slices);
+    auto moved = std::move(operation);
+    const std::vector<ErrorCode> expected(kObjectCount, ErrorCode::OK);
+    EXPECT_EQ(moved.wait(), expected);
+    EXPECT_EQ(moved.wait(), expected);
+    EXPECT_EQ(destination_, source_);
+}
+
+TEST_F(BatchReadTest, DestructionDrainsOutstandingReads) {
+    {
+        auto operation =
+            submitter_->submitBatchRead(Replicas(), Destinations());
+        // The caller is allowed to abandon the result, but not the transfer's
+        // ownership of its buffers. Destruction must finish before we inspect.
+    }
+    EXPECT_EQ(destination_, source_);
+}
+
+TEST_F(BatchReadTest, EmptyAndMismatchedInputs) {
+    EXPECT_TRUE(submitter_->submitBatchRead({}, {}).wait().empty());
+    EXPECT_EQ(submitter_->submitBatchRead(Replicas(), {}).wait(),
+              std::vector<ErrorCode>(kObjectCount, ErrorCode::TRANSFER_FAIL));
+    EXPECT_TRUE(std::all_of(destination_.begin(), destination_.end(),
+                            [](char value) { return value == '?'; }));
+}
+
+TEST_F(BatchReadTest, CompletionPreservesSharedRemoteHandle) {
+    const auto endpoint = server_->getLocalIpAndPort();
+    const auto handle = client_->openSegment(endpoint);
+    ASSERT_NE(handle, static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT));
+    std::vector<SegmentBufferInfo> buffers;
+    ASSERT_EQ(client_->getSegmentBuffers(handle, buffers), 0);
+
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        auto slices = Destinations();
+        auto expected = std::vector<ErrorCode>(kObjectCount, ErrorCode::OK);
+        if (iteration == 1) {
+            slices[0][0].size -= 1;
+            expected[0] = ErrorCode::TRANSFER_FAIL;
+        }
+        {
+            auto operation = submitter_->submitBatchRead(Replicas(), slices);
+            EXPECT_EQ(operation.wait(), expected);
+        }
+        // Another caller may still be using this handle after the batch is
+        // complete, including when one object failed validation.
+        ASSERT_EQ(client_->getSegmentBuffers(handle, buffers), 0);
+        EXPECT_EQ(client_->openSegment(endpoint), handle);
+    }
+}
+
+TEST_F(BatchReadTest, ConcurrentBatchesAndSingleReadsShareRemoteHandle) {
+    constexpr size_t kReaders = 4;
+    constexpr size_t kIterations = 32;
+    const auto replicas = Replicas();
+    std::vector<char> destinations(source_.size() * kReaders, '?');
+    ASSERT_EQ(
+        client_->registerLocalMemory(destinations.data(), destinations.size()),
+        0);
+    ScopedEnvVar memcpy_config("MC_STORE_MEMCPY", "0");
+    TransferSubmitter submitter(*client_, backend_,
+                                client_->getLocalIpAndPort());
+    std::atomic<size_t> failures{0};
+    std::barrier start(kReaders);
+    std::vector<std::thread> readers;
+    for (size_t reader = 0; reader < kReaders; ++reader) {
+        readers.emplace_back([&, reader] {
+            auto* destination = destinations.data() + reader * source_.size();
+            std::vector<std::vector<Slice>> slices;
+            for (size_t i = 0; i < kObjectCount; ++i)
+                slices.push_back(
+                    {{destination + i * kObjectSize, kObjectSize}});
+            start.arrive_and_wait();
+            for (size_t iteration = 0;
+                 iteration < kIterations && failures.load() == 0; ++iteration) {
+                std::fill_n(destination, source_.size(), '?');
+                if (reader == 0) {
+                    for (size_t i = 0; i < kObjectCount; ++i) {
+                        auto future = submitter.submit(replicas[i], slices[i],
+                                                       TransferRequest::READ);
+                        if (!future ||
+                            future->strategy() !=
+                                TransferStrategy::TRANSFER_ENGINE ||
+                            future->get() != ErrorCode::OK) {
+                            ++failures;
+                            return;
+                        }
+                    }
+                } else {
+                    auto operation =
+                        submitter.submitBatchRead(replicas, slices);
+                    const auto& results = operation.wait();
+                    if (results.size() != kObjectCount ||
+                        !std::all_of(results.begin(), results.end(),
+                                     [](ErrorCode result) {
+                                         return result == ErrorCode::OK;
+                                     })) {
+                        ++failures;
+                        return;
+                    }
+                }
+                if (!std::equal(source_.begin(), source_.end(), destination)) {
+                    ++failures;
+                    return;
+                }
+            }
+        });
+    }
+    for (auto& reader : readers) reader.join();
+    EXPECT_EQ(failures.load(), 0u);
+    EXPECT_EQ(client_->unregisterLocalMemory(destinations.data()), 0);
 }
 
 // Test TransferStrategy enum and stream operator

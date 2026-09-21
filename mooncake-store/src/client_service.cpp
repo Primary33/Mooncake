@@ -70,6 +70,14 @@ namespace {
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
 
+// Amortize submission overhead for small reads. Larger reads should enter the
+// engine immediately to overlap preparation with transfer and preserve the
+// backend's per-object fragmentation. Bound both bytes and bookkeeping per
+// batch.
+constexpr size_t kBatchReadObjectSizeLimit = 64 * 1024;
+constexpr size_t kBatchReadMaxBytes = 1024 * 1024;
+constexpr size_t kBatchReadMaxObjects = 64;
+
 class ScopedObjectChecksumBuffer {
    public:
     ScopedObjectChecksumBuffer(PinnedBufferPool& pool, size_t size)
@@ -1620,6 +1628,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     std::vector<std::tuple<size_t, std::string, TransferFuture,
                            Replica::Descriptor, bool>>
         pending_transfers;
+    struct RemoteReadGroup {
+        std::vector<size_t> indices;
+        std::vector<Replica::Descriptor> replicas;
+        std::vector<std::vector<Slice>> slices;
+        size_t bytes = 0;
+        std::optional<BatchReadOperation> operation;
+    };
+    std::unordered_map<std::string, RemoteReadGroup> remote_reads;
+    std::vector<RemoteReadGroup> pending_batches;
     std::vector<DfsReadRequest> dfs_read_requests;
     std::vector<size_t> dfs_read_indices;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
@@ -1628,6 +1645,29 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
     // Collect cache hit statistics for the entire batch
     size_t total_cache_hits = 0;
+
+    // Keep submitted groups alive until completion, while allowing the next
+    // group for the same endpoint to be prepared without waiting for this one.
+    auto submit_remote_reads = [&](RemoteReadGroup& group) {
+        if (group.indices.empty()) return;
+        if (group.indices.size() == 1) {
+            const size_t index = group.indices[0];
+            auto future = transfer_submitter_->submit(
+                group.replicas[0], group.slices[0], TransferRequest::READ);
+            if (!future) {
+                results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            } else {
+                pending_transfers.emplace_back(
+                    index, object_keys[index], std::move(*future),
+                    std::move(group.replicas[0]), false);
+            }
+        } else {
+            group.operation.emplace(transfer_submitter_->submitBatchRead(
+                group.replicas, group.slices));
+            pending_batches.push_back(std::move(group));
+        }
+        group = {};
+    };
 
     // Submit all transfers in parallel
     for (size_t i = 0; i < object_keys.size(); ++i) {
@@ -1659,6 +1699,31 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             if (cache_used) {
                 total_cache_hits++;
             }
+        }
+
+        // Batch only small remote memory reads. Submit larger objects directly
+        // below, without first collecting them or copying their slice vectors.
+        if (object_keys.size() > 1 && replica.is_memory_replica() &&
+            !cache_used &&
+            replica.get_memory_descriptor().buffer_descriptor.size_ <
+                kBatchReadObjectSizeLimit &&
+            !CanUseLocalMemcpy(replica)) {
+            const auto& descriptor =
+                replica.get_memory_descriptor().buffer_descriptor;
+            const auto& endpoint = descriptor.transport_endpoint_;
+            auto& group = remote_reads[endpoint];
+            if (descriptor.size_ > kBatchReadMaxBytes - group.bytes) {
+                submit_remote_reads(group);
+            }
+            group.bytes += descriptor.size_;
+            group.indices.push_back(i);
+            group.replicas.push_back(std::move(replica));
+            group.slices.push_back(slices_it->second);
+            if (group.bytes == kBatchReadMaxBytes ||
+                group.indices.size() == kBatchReadMaxObjects) {
+                submit_remote_reads(group);
+            }
+            continue;
         }
 
         // Submit transfer operation asynchronously
@@ -1708,6 +1773,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         pending_transfers.emplace_back(i, key, std::move(*future), replica,
                                        cache_used);
+    }
+
+    // Submit every destination before waiting, including before synchronous
+    // DFS reads below, to retain overlap across different storage paths.
+    for (auto& [endpoint, group] : remote_reads) {
+        submit_remote_reads(group);
     }
 
     if (!dfs_read_requests.empty()) {
@@ -1778,11 +1849,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << ", latency_us=" << dfs_read_latency_us;
     }
 
-    // Wait for all transfers to complete
-    for (auto& [index, key, future, stored_replica, cache_used] :
-         pending_transfers) {
-        ErrorCode result = future.get();
-
+    auto finish_read = [&](size_t index,
+                           const Replica::Descriptor& stored_replica,
+                           bool cache_used, ErrorCode result) {
+        const auto& key = object_keys[index];
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
             hot_cache_->ReleaseHotKey(key);
@@ -1797,14 +1867,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             auto slices_it = slices.find(key);
             if (slices_it == slices.end()) {
                 results[index] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-                continue;
+                return;
             }
             auto checksum_result = VerifyObjectChecksum(
                 key, slices_it->second, calculate_total_size(stored_replica),
                 query_results[index].object_checksum);
             if (!checksum_result) {
                 results[index] = tl::unexpected(checksum_result.error());
-                continue;
+                return;
             }
             results[index] = {};
 
@@ -1817,6 +1887,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                     ProcessSlicesAsync(key, slices_it->second, stored_replica);
                 }
             }
+        }
+    };
+
+    // Reuse per-object completion handling for both submission modes.
+    for (auto& [index, key, future, stored_replica, cache_used] :
+         pending_transfers) {
+        finish_read(index, stored_replica, cache_used, future.get());
+    }
+    for (auto& group : pending_batches) {
+        const auto& read_results = group.operation->wait();
+        for (size_t i = 0; i < group.indices.size(); ++i) {
+            finish_read(group.indices[i], group.replicas[i], false,
+                        read_results[i]);
         }
     }
 

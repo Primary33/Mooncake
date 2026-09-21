@@ -524,13 +524,28 @@ class FilereadWorkerPool {
     std::shared_ptr<StorageBackend> backend_;
 };
 
-/**
- * @brief Submitter class for asynchronous transfer operations
- *
- * This class analyzes transfer requirements, selects optimal strategies, and
- * immediately submits operations returning TransferFuture objects for result
- * tracking.
- */
+// A single-consumer batch of independent remote memory reads. Destruction
+// drains outstanding transfers; callers must keep destination buffers alive
+// until wait() returns or the operation is destroyed.
+class BatchReadOperation {
+   public:
+    BatchReadOperation(BatchReadOperation&&) noexcept;
+    BatchReadOperation& operator=(BatchReadOperation&&) noexcept;
+    ~BatchReadOperation();
+
+    BatchReadOperation(const BatchReadOperation&) = delete;
+    BatchReadOperation& operator=(const BatchReadOperation&) = delete;
+
+    const std::vector<ErrorCode>& wait();
+
+   private:
+    class Impl;
+    explicit BatchReadOperation(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+    friend class TransferSubmitter;
+};
+
+// Selects transfer strategies and submits asynchronous operations.
 class TransferSubmitter {
    public:
     explicit TransferSubmitter(TransferEngine& engine,
@@ -576,6 +591,12 @@ class TransferSubmitter {
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
         TransferRequest::OpCode op_code);
+
+    // Unlike submit_batch(), retains one result per object. Local memcpy and
+    // non-memory replicas should continue through submit().
+    BatchReadOperation submitBatchRead(
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<std::vector<Slice>>& all_slices);
 
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,

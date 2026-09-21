@@ -1103,7 +1103,7 @@ TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
     std::array<size_t, 1> offsets{0};
     std::array<size_t, 1> lengths{1};
 
-    auto run = [&] {
+    auto run = [&](const TransferEngine::ScatterTransferOptions& options) {
         std::vector<bool> fragment_ok;
         TransferEngine::ScatterTransferRange range{
             .opcode = TransferRequest::READ,
@@ -1120,15 +1120,62 @@ TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
                     fragment_ok.push_back(status.ok());
                 },
         };
-        auto operation = engine.submitScatter({range, range});
+        auto operation = engine.submitScatter({range, range}, options);
         EXPECT_FALSE(operation.wait().ok());
         return fragment_ok;
     };
 
-    EXPECT_EQ(run(), (std::vector<bool>{true, false}));
-    EXPECT_EQ(transport->request_counts, (std::vector<size_t>{2}));
+    EXPECT_EQ(run({}), (std::vector<bool>{true, false}));
+    const TransferEngine::ScatterTransferOptions independent_reads{
+        .cancel_on_error = false, .busy_poll = true};
+    EXPECT_EQ(run(independent_reads), (std::vector<bool>{true, false}));
+    EXPECT_EQ(transport->request_counts, (std::vector<size_t>{2, 2}));
     transport->addExtraSlice();
-    EXPECT_EQ(run(), (std::vector<bool>{false, false}));
+    EXPECT_EQ(run(independent_reads), (std::vector<bool>{false, false}));
+}
+
+TEST_F(TransportTest,
+       IndependentScatterWaitsForPhysicalCompletionAfterFailure) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<TerminalFailureTransport>(false);
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(
+        impl, {{"terminal-failure", transport}});
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "terminal-failure";
+    impl.getMetadata()->addLocalSegment(12, "remote", std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{1};
+    size_t callbacks = 0;
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete =
+            [&](size_t, const Status& status) {
+                EXPECT_FALSE(status.ok());
+                ++callbacks;
+            },
+    };
+    auto operation = engine.submitScatter(
+        {range}, {.cancel_on_error = false, .busy_poll = true});
+    EXPECT_TRUE(operation.waitFor(std::chrono::milliseconds(0)).IsClock());
+    EXPECT_EQ(callbacks, 1);
+    EXPECT_TRUE(operation.waitFor(std::chrono::milliseconds(0)).IsClock());
+    transport->finishTasks();
+    EXPECT_FALSE(operation.wait().ok());
+    EXPECT_FALSE(operation.waitFor(std::chrono::milliseconds(0)).IsClock());
+    EXPECT_EQ(callbacks, 1);
 }
 
 // Model the state left by completion events explicitly so these regressions

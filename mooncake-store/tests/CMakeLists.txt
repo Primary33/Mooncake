@@ -145,7 +145,7 @@ add_test(
   NAME object_checksum_client_test
   COMMAND
     client_integration_test
-    "--gtest_filter=ObjectChecksumTest.*:ClientIntegrationTest.ObjectChecksumRejectsCorruptedObject:ClientIntegrationTest.BatchPutPreservesObjectChecksumPairing"
+    "--gtest_filter=ObjectChecksumTest.*:ClientIntegrationTest.ObjectChecksumRejectsCorruptedObject:ClientIntegrationTest.BatchPutPreservesObjectChecksumPairing:ClientIntegrationTest.DefaultBatchGetIsolatesChecksumFailure"
 )
 set_tests_properties(object_checksum_client_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
@@ -162,9 +162,21 @@ add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 if(USE_TENT)
   add_test(
+    NAME batch_get_tent_test
+    COMMAND
+      client_integration_test
+      "--gtest_filter=ClientIntegrationTest.DefaultBatchGet*:ClientIntegrationTest.BatchGetChecksLeasesWithPreferredNode:ClientIntegrationTest.BatchGetPreservesTransferErrorWithExpiredLease:ClientIntegrationTest.BatchGetDuplicateKeysFanOut"
+  )
+  set_tests_properties(
+    batch_get_tent_test
+    PROPERTIES ENVIRONMENT
+               "MC_USE_TENT=1;MC_FORCE_TCP=1;MOONCAKE_STORE_CHECKSUM=1" TIMEOUT
+               90)
+  add_test(
     NAME transfer_task_tent_completion_test
-    COMMAND transfer_task_test
-            --gtest_filter=TransferTaskTest.RemoteTransferWaitCompletesCorrectly
+    COMMAND
+      transfer_task_test
+      --gtest_filter=TransferTaskTest.RemoteTransferWaitCompletesCorrectly:BatchReadTest.*
   )
   set_tests_properties(transfer_task_tent_completion_test
                        PROPERTIES ENVIRONMENT "MC_USE_TENT=1" TIMEOUT 30)

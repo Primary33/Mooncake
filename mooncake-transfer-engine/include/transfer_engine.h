@@ -176,6 +176,14 @@ class TransferEngine {
         std::function<void(size_t, const Status&)> on_fragment_complete;
     };
 
+    struct ScatterTransferOptions {
+        // Set false for independent requests: a failure does not cancel peers.
+        // Either mode still drains all published tasks before releasing state.
+        bool cancel_on_error = true;
+        // Poll without sleeping for latency-sensitive callers.
+        bool busy_poll = false;
+    };
+
     class ScatterTransferOperation {
        public:
         ScatterTransferOperation(ScatterTransferOperation&&) noexcept;
@@ -204,8 +212,13 @@ class TransferEngine {
         friend class TransferEngine;
     };
 
+    // Remote segment handles are shared with other engine users and remain
+    // cached after the operation completes.
     ScatterTransferOperation submitScatter(
         const std::vector<ScatterTransferRange>& ranges);
+    ScatterTransferOperation submitScatter(
+        const std::vector<ScatterTransferRange>& ranges,
+        const ScatterTransferOptions& options);
     Status transferScatter(const std::vector<ScatterTransferRange>& ranges);
 
     Status submitTransferWithNotify(BatchID batch_id,

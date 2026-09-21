@@ -206,6 +206,8 @@ class Client {
      * @param slices Map of object keys to their data slices
      * @return Vector of ErrorCode results for each object
      */
+    // Small remote memory reads use bounded batches per endpoint; larger reads
+    // are submitted immediately. Every object retains an independent result.
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,

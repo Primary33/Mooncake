@@ -1150,8 +1150,9 @@ class TransferEngine::ScatterTransferOperation::Impl {
     };
 
     Impl(TransferEngine& engine, Backend backend,
-         const std::vector<ScatterTransferRange>& ranges)
-        : backend_(std::move(backend)) {
+         const std::vector<ScatterTransferRange>& ranges,
+         const ScatterTransferOptions& options)
+        : backend_(std::move(backend)), options_(options) {
         callbacks_.reserve(ranges.size());
         size_t fragment_count = 0;
         for (const auto& range : ranges) {
@@ -1168,7 +1169,8 @@ class TransferEngine::ScatterTransferOperation::Impl {
     Status wait() {
         while (!completed_) {
             poll();
-            if (!completed_) std::this_thread::sleep_for(kPollInterval);
+            if (!completed_ && !options_.busy_poll)
+                std::this_thread::sleep_for(kPollInterval);
         }
         return aggregate_status_;
     }
@@ -1190,7 +1192,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
             if (completed_) break;
             if (std::chrono::steady_clock::now() >= deadline)
                 return Status::Clock("scatter transfer wait timed out");
-            std::this_thread::sleep_for(kPollInterval);
+            if (!options_.busy_poll) std::this_thread::sleep_for(kPollInterval);
         }
         return aggregate_status_;
     }
@@ -1204,15 +1206,6 @@ class TransferEngine::ScatterTransferOperation::Impl {
 #else
         return false;
 #endif
-    }
-
-    int closeSegment(SegmentHandle handle) {
-#ifdef USE_TENT
-        if (backend_.tent)
-            return tentToClassicError(
-                backend_.tent->closeSegment(handle).code());
-#endif
-        return backend_.legacy->closeSegment(handle);
     }
 
     Status getStatus(BatchID batch_id, size_t task_id, TransferStatus& status) {
@@ -1245,21 +1238,11 @@ class TransferEngine::ScatterTransferOperation::Impl {
         if (aggregate_status_.ok() && !status.ok()) aggregate_status_ = status;
     }
 
-    Status closeSegments(Status status) {
-        for (const auto& entry : segment_handles_) {
-            if (entry.second ==
-                static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT))
-                continue;
-            if (closeSegment(entry.second) != 0 && status.ok())
-                status =
-                    Status::Context("failed to close scatter transfer segment");
-        }
-        segment_handles_.clear();
-        return status;
-    }
-
     void finish() {
-        aggregate_status_ = closeSegments(aggregate_status_);
+        // openSegment borrows the engine's cached handle. Closing it here
+        // invalidates concurrent users and forces TENT to refetch metadata on
+        // the next batch. Only release this operation's handle lookup table.
+        segment_handles_.clear();
         completed_ = true;
         callbacks_.clear();
         requests_.clear();
@@ -1298,6 +1281,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
 
     void requestAbort(const Status& status) {
         remember(status);
+        if (!options_.cancel_on_error) return;
         if (abort_requested_) return;
         abort_requested_ = true;
 #ifdef USE_TENT
@@ -1519,6 +1503,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
     }
 
     Backend backend_;
+    const ScatterTransferOptions options_;
     std::vector<TransferRequest> requests_;
     std::vector<std::pair<size_t, size_t>> request_fragments_;
     std::vector<std::function<void(size_t, const Status&)>> callbacks_;
@@ -1560,6 +1545,12 @@ Status TransferEngine::ScatterTransferOperation::waitFor(
 
 TransferEngine::ScatterTransferOperation TransferEngine::submitScatter(
     const std::vector<ScatterTransferRange>& ranges) {
+    return submitScatter(ranges, ScatterTransferOptions{});
+}
+
+TransferEngine::ScatterTransferOperation TransferEngine::submitScatter(
+    const std::vector<ScatterTransferRange>& ranges,
+    const ScatterTransferOptions& options) {
     ScatterTransferOperation::Impl::Backend backend;
     backend.legacy = impl_;
 #ifdef USE_TENT
@@ -1568,7 +1559,7 @@ TransferEngine::ScatterTransferOperation TransferEngine::submitScatter(
 
     return ScatterTransferOperation(
         std::make_unique<ScatterTransferOperation::Impl>(
-            *this, std::move(backend), ranges));
+            *this, std::move(backend), ranges, options));
 }
 
 Status TransferEngine::transferScatter(

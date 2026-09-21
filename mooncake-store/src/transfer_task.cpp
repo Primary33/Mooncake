@@ -933,6 +933,123 @@ TransferStrategy TransferFuture::strategy() const {
     return state_->get_strategy();
 }
 
+class BatchReadOperation::Impl {
+   public:
+    Impl(TransferEngine& engine,
+         const std::vector<Replica::Descriptor>& replicas,
+         const std::vector<std::vector<Slice>>& all_slices,
+         TransferMetric* metric)
+        : results_(replicas.size(), ErrorCode::TRANSFER_FAIL) {
+        if (replicas.size() != all_slices.size()) return;
+
+        size_t fragment_count = 0;
+        for (const auto& slices : all_slices) fragment_count += slices.size();
+        // Scatter ranges borrow these arrays during submission. Reserve before
+        // building any spans so subsequent objects cannot invalidate them.
+        zero_offsets_.resize(fragment_count, 0);
+        remote_offsets_.reserve(fragment_count);
+        lengths_.reserve(fragment_count);
+        std::vector<TransferEngine::ScatterTransferRange> ranges;
+        ranges.reserve(fragment_count);
+
+        for (size_t i = 0; i < replicas.size(); ++i) {
+            if (!replicas[i].is_memory_replica()) continue;
+            const auto& handle =
+                replicas[i].get_memory_descriptor().buffer_descriptor;
+            const auto& slices = all_slices[i];
+            if (!validObject(handle, slices)) continue;
+
+            results_[i] = ErrorCode::OK;
+            uint64_t offset = 0;
+            for (const auto& slice : slices) {
+                if (slice.size == 0) continue;
+                const size_t index = lengths_.size();
+                remote_offsets_.push_back(static_cast<size_t>(offset));
+                lengths_.push_back(slice.size);
+                ranges.push_back(TransferEngine::ScatterTransferRange{
+                    .opcode = TransferRequest::READ,
+                    .remote_segment = handle.transport_endpoint_,
+                    .remote_base_offset = handle.buffer_address_,
+                    .remote_size = static_cast<size_t>(handle.size_),
+                    .local_buffer = slice.ptr,
+                    .local_capacity = slice.size,
+                    .local_offsets =
+                        std::span<const size_t>(&zero_offsets_[index], 1),
+                    .remote_offsets =
+                        std::span<const size_t>(&remote_offsets_[index], 1),
+                    .lengths = std::span<const size_t>(&lengths_[index], 1),
+                    .on_fragment_complete =
+                        [this, i](size_t, const Status& status) {
+                            if (!status.ok())
+                                results_[i] = ErrorCode::TRANSFER_FAIL;
+                        },
+                });
+                offset += slice.size;
+            }
+        }
+        if (ranges.empty()) return;
+
+        TransferEngine::ScatterTransferOptions options;
+        options.cancel_on_error = false;
+        options.busy_poll = true;
+        operation_.emplace(engine.submitScatter(ranges, options));
+        if (metric) {
+            for (size_t i = 0; i < results_.size(); ++i) {
+                // Synchronous preparation failures have already invoked their
+                // callbacks. Count accepted reads as in submit(), even when a
+                // later asynchronous transfer fails.
+                if (results_[i] == ErrorCode::OK)
+                    metric->total_read_bytes.inc(replicas[i]
+                                                     .get_memory_descriptor()
+                                                     .buffer_descriptor.size_);
+            }
+        }
+    }
+
+    const std::vector<ErrorCode>& wait() {
+        if (operation_) (void)operation_->wait();
+        // A batch-level error must not overwrite independently completed keys.
+        // The scatter callbacks provide the result of every submitted fragment.
+        return results_;
+    }
+
+   private:
+    static bool validObject(const AllocatedBuffer::Descriptor& handle,
+                            const std::vector<Slice>& slices) {
+        if (handle.transport_endpoint_.empty() || handle.size_ == 0 ||
+            handle.buffer_address_ >
+                std::numeric_limits<uint64_t>::max() - handle.size_)
+            return false;
+        uint64_t total = 0;
+        for (const auto& slice : slices) {
+            if ((slice.size != 0 && slice.ptr == nullptr) ||
+                slice.size > handle.size_ - total)
+                return false;
+            total += slice.size;
+        }
+        return total == handle.size_;
+    }
+
+    std::vector<ErrorCode> results_;
+    std::vector<size_t> zero_offsets_;
+    std::vector<size_t> remote_offsets_;
+    std::vector<size_t> lengths_;
+    // Declared last: drain before destroying callback targets or range storage.
+    std::optional<TransferEngine::ScatterTransferOperation> operation_;
+};
+
+BatchReadOperation::BatchReadOperation(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+BatchReadOperation::BatchReadOperation(BatchReadOperation&&) noexcept = default;
+BatchReadOperation& BatchReadOperation::operator=(
+    BatchReadOperation&&) noexcept = default;
+BatchReadOperation::~BatchReadOperation() = default;
+
+const std::vector<ErrorCode>& BatchReadOperation::wait() {
+    return impl_->wait();
+}
+
 // ============================================================================
 // TransferSubmitter Implementation
 // ============================================================================
@@ -1097,6 +1214,13 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         }
     }
     return future;
+}
+
+BatchReadOperation TransferSubmitter::submitBatchRead(
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::vector<std::vector<Slice>>& all_slices) {
+    return BatchReadOperation(std::make_unique<BatchReadOperation::Impl>(
+        engine_, replicas, all_slices, transfer_metric_));
 }
 
 TransferEngine::ScatterTransferOperation TransferSubmitter::submitScatter(
