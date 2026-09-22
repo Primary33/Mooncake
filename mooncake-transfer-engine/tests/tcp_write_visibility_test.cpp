@@ -36,6 +36,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -564,7 +565,10 @@ class ScopedEnvVar {
             had_old_value_ = true;
             old_value_ = old;
         }
-        setenv(name_.c_str(), value, 1);
+        if (value)
+            setenv(name_.c_str(), value, 1);
+        else
+            unsetenv(name_.c_str());
     }
 
     ~ScopedEnvVar() {
@@ -2028,6 +2032,57 @@ TEST(TcpWriteVisibilityTest, StaleV2DescriptorShortRequestFailsWithinDeadline) {
             << static_cast<int>(opcode) << ")";
         legacy_server.join();
     }
+}
+
+TEST(TcpWriteVisibilityTest, IndependentScatterReadsUseMultipleLanes) {
+    constexpr size_t kObjectCount = 32;
+    constexpr size_t kObjectSize = 4096;
+    ScopedEnvVar use_tent("MC_USE_TENT", nullptr);
+    ScopedEnvVar use_tev1("MC_USE_TEV1", nullptr);
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "4");
+    ScopedEnvVar status_timeout("MC_TCP_STATUS_TIMEOUT_SEC", "30");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "64");
+    HoldingWriteServer peer;
+    ASSERT_TRUE(peer.ok());
+    EngineHandle h;
+    h.init("P2PHANDSHAKE", "127.0.0.1:0", kObjectCount * kObjectSize);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, peer.port());
+
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{kObjectSize};
+    std::array<size_t, kObjectCount> callbacks{};
+    std::vector<TransferEngine::ScatterTransferRange> ranges;
+    for (size_t i = 0; i < kObjectCount; ++i) {
+        ranges.push_back({
+            .opcode = TransferRequest::READ,
+            .remote_segment = h.engine->getLocalIpAndPort(),
+            .remote_base_offset = h.remote_base + i * kObjectSize,
+            .remote_size = kObjectSize,
+            .local_buffer = static_cast<char*>(h.pool) + i * kObjectSize,
+            .local_capacity = kObjectSize,
+            .local_offsets = offsets,
+            .remote_offsets = offsets,
+            .lengths = lengths,
+            .on_fragment_complete =
+                [&, i](size_t, const Status& status) {
+                    ++callbacks[i];
+                    EXPECT_FALSE(status.ok());
+                },
+        });
+    }
+    auto operation = h.engine->submitScatter(
+        ranges, {.cancel_on_error = false, .busy_poll = false});
+    // This peer never replies to a READ. Four accepted connections demonstrate
+    // concurrent scheduling while the first request is still unfinished.
+    EXPECT_TRUE(peer.waitForAccepted(4, std::chrono::seconds(2)));
+    EXPECT_EQ(peer.activeAcceptedCount(), 4);
+    EXPECT_EQ(peer.maxAcceptedCount(), 4);
+    peer.closePeer();
+    const auto status = operation.waitFor(std::chrono::seconds(60));
+    EXPECT_FALSE(status.IsClock());
+    EXPECT_FALSE(status.ok());
+    for (auto count : callbacks) EXPECT_EQ(count, 1u);
 }
 
 TEST(TcpWriteVisibilityTest, PerPeerLaneAndQueueBoundsHoldUnderLoad) {

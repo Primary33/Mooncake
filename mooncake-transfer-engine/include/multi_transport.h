@@ -55,7 +55,8 @@ class MultiTransport {
                           const std::vector<TransferRequest> &entries);
 
     Status submitScatter(const std::vector<TransferRequest> &entries,
-                         ScatterSubmission &submission);
+                         ScatterSubmission &submission,
+                         bool independent_requests = false);
 
 #ifdef ENABLE_MULTI_PROTOCOL
     Status mp_submitTransfer(BatchID batch_id,
@@ -96,7 +97,8 @@ class MultiTransport {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries,
-                          std::vector<size_t> *task_sizes);
+                          std::vector<size_t> *task_sizes,
+                          bool independent_requests = false);
 
     Status selectTransport(const TransferRequest &entry, Transport *&transport);
 

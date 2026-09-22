@@ -430,6 +430,20 @@ class Transport {
         return submitTransferTask(task_list);
     }
 
+    // A synchronous submission failure must not fail or skip peer tasks.
+    // Transports may override this to retain batching across independent tasks.
+    virtual Status submitTransferTaskIndependent(
+        const std::vector<TransferTask *> &task_list) {
+        Status result = Status::OK();
+        std::vector<TransferTask *> single_task(1);
+        for (auto *task : task_list) {
+            single_task[0] = task;
+            auto status = submitTransferTask(single_task);
+            if (result.ok() && !status.ok()) result = status;
+        }
+        return result;
+    }
+
     // Grouped transports must append slices in request order so scatter can
     // recover per-request status after a grouped task fails.
     virtual bool supportsGroupedScatter() const { return false; }

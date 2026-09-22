@@ -1364,7 +1364,9 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     .target_id = *segment_handle,
                     .target_offset = range.remote_base_offset + remote_offset,
                     .length = length,
-                    .task_group_id = 1,
+                    .task_group_id = options_.cancel_on_error
+                                         ? 1
+                                         : TransferRequest::kNoTaskGroup,
                 });
                 request_fragments_.emplace_back(range_index, fragment_index);
             }
@@ -1384,8 +1386,8 @@ class TransferEngine::ScatterTransferOperation::Impl {
                 submit_status = engine.submitTransfer(batch_id_, requests_);
         } else {
             MultiTransport::ScatterSubmission submission;
-            submit_status =
-                backend_.legacy->submitScatter(requests_, submission);
+            submit_status = backend_.legacy->submitScatter(
+                requests_, submission, !options_.cancel_on_error);
             batch_id_ = submission.batch_id;
             task_sizes_ = std::move(submission.task_sizes);
         }

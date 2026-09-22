@@ -93,6 +93,9 @@ class RdmaTransport : public Transport {
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
 
+    Status submitTransferTaskIndependent(
+        const std::vector<TransferTask *> &task_list) override;
+
     bool supportsGroupedScatter() const override { return true; }
 
     Status getTransferStatus(BatchID batch_id,
@@ -104,6 +107,9 @@ class RdmaTransport : public Transport {
     SegmentID getSegmentID(const std::string &segment_name);
 
    private:
+    Status submitTransferTaskImpl(const std::vector<TransferTask *> &task_list,
+                                  bool independent_tasks);
+
     int allocateLocalSegmentID();
 
     int refreshLocalDeviceDesc(const std::string &device_name, uint16_t lid,

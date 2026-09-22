@@ -835,6 +835,16 @@ Status RdmaTransport::submitTransfer(
 
 Status RdmaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
+    return submitTransferTaskImpl(task_list, false);
+}
+
+Status RdmaTransport::submitTransferTaskIndependent(
+    const std::vector<TransferTask *> &task_list) {
+    return submitTransferTaskImpl(task_list, true);
+}
+
+Status RdmaTransport::submitTransferTaskImpl(
+    const std::vector<TransferTask *> &task_list, bool independent_tasks) {
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
@@ -875,9 +885,26 @@ Status RdmaTransport::submitTransferTask(
         task.total_bytes += slice->length;
         __sync_fetch_and_add(&task.slice_count, 1);
         slice->markFailed();
-        fail_unposted_slices();
-        fail_unstarted_tasks(task_index + 1);
+        if (independent_tasks) {
+            // Retain peers in the batching accumulator. Already-posted slices
+            // still complete normally and keep their task alive until polled.
+            for (auto &entry : slices_to_post) {
+                auto &slices = entry.second;
+                slices.erase(std::remove_if(slices.begin(), slices.end(),
+                                            [&](Slice *pending) {
+                                                if (pending->task != &task)
+                                                    return false;
+                                                pending->markFailed();
+                                                return true;
+                                            }),
+                             slices.end());
+            }
+        } else {
+            fail_unposted_slices();
+            fail_unstarted_tasks(task_index + 1);
+        }
     };
+    Status result = Status::OK();
     uint64_t nr_slices;
     size_t task_index = 0, request_index = 0;
     int last_local_buffer_id = -1;
@@ -983,17 +1010,27 @@ Status RdmaTransport::submitTransferTask(
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
                     << source_addr;
-                return Status::AddressNotRegistered(
+                auto status = Status::AddressNotRegistered(
                     "Memory region not registered by any active device(s): " +
                     std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
+                if (!independent_tasks) return status;
+                if (result.ok()) result = status;
+                task_index = current_task_index + 1;
+                request_index = 0;
+                break;
             } else {
                 auto &context = context_list_[device_id];
                 if (!context->active()) {
                     fail_task_and_cleanup(task, slice, current_task_index);
                     LOG(ERROR) << "Device " << device_id << " is not active";
-                    return Status::InvalidArgument("Device " +
-                                                   std::to_string(device_id) +
-                                                   " is not active");
+                    auto status = Status::InvalidArgument(
+                        "Device " + std::to_string(device_id) +
+                        " is not active");
+                    if (!independent_tasks) return status;
+                    if (result.ok()) result = status;
+                    task_index = current_task_index + 1;
+                    request_index = 0;
+                    break;
                 }
                 slice->rdma.source_lkey =
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
@@ -1020,7 +1057,7 @@ Status RdmaTransport::submitTransferTask(
 
     for (auto &entry : slices_to_post)
         if (!entry.second.empty()) entry.first->submitPostSend(entry.second);
-    return Status::OK();
+    return result;
 }
 
 Status RdmaTransport::getTransferStatus(BatchID batch_id,

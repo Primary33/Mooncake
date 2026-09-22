@@ -138,7 +138,7 @@ Status MultiTransport::submitTransfer(
 
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
-    std::vector<size_t>* task_sizes) {
+    std::vector<size_t>* task_sizes, bool independent_requests) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     if (!task_sizes &&
         batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
@@ -164,7 +164,8 @@ Status MultiTransport::submitTransfer(
     for (size_t i = 0; i < entries.size();) {
         size_t count = 1;
         const auto group_id = entries[i].task_group_id;
-        if (task_sizes && group_id != TransferRequest::kNoTaskGroup &&
+        if (task_sizes && !independent_requests &&
+            group_id != TransferRequest::kNoTaskGroup &&
             transports[i]->supportsGroupedScatter()) {
             while (i + count < entries.size() &&
                    entries[i + count].task_group_id == group_id &&
@@ -181,7 +182,7 @@ Status MultiTransport::submitTransfer(
 #endif
         task.request_count = count;
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-        if (count > 1) task.submission_sealed = false;
+        if (count > 1 || independent_requests) task.submission_sealed = false;
 #endif
         submit_tasks[transports[i]].push_back(&task);
         if (task_sizes) task_sizes->push_back(count);
@@ -190,10 +191,13 @@ Status MultiTransport::submitTransfer(
     if (task_sizes) batch_desc.batch_size = task_list.size();
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
-        auto status = entry.first->submitTransferTask(entry.second);
+        auto status =
+            independent_requests
+                ? entry.first->submitTransferTaskIndependent(entry.second)
+                : entry.first->submitTransferTask(entry.second);
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         for (auto* task : entry.second)
-            if (task->request_count > 1)
+            if (task->request_count > 1 || independent_requests)
                 Transport::Slice::sealTaskSubmission(task);
 #endif
         if (!status.ok()) {
@@ -206,8 +210,8 @@ Status MultiTransport::submitTransfer(
 }
 
 Status MultiTransport::submitScatter(
-    const std::vector<TransferRequest>& entries,
-    ScatterSubmission& submission) {
+    const std::vector<TransferRequest>& entries, ScatterSubmission& submission,
+    bool independent_requests) {
     submission = {};
     if (entries.empty())
         return Status::InvalidArgument("scatter transfer is empty");
@@ -215,7 +219,8 @@ Status MultiTransport::submitScatter(
     if (submission.batch_id == static_cast<BatchID>(-1))
         return Status::InvalidArgument(
             "failed to allocate scatter transfer batch");
-    return submitTransfer(submission.batch_id, entries, &submission.task_sizes);
+    return submitTransfer(submission.batch_id, entries, &submission.task_sizes,
+                          independent_requests);
 }
 
 #ifdef ENABLE_MULTI_PROTOCOL

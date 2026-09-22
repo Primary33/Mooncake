@@ -462,12 +462,15 @@ class PartialFailureSubmissionTransport : public BatchResultTransport {
         for (auto* task : tasks) {
             request_counts.push_back(task->request_count);
             task->slice_count = task->request_count;
-            task->success_slice_count = 1;
-            task->failed_slice_count = task->request_count - 1;
             for (size_t i = 0; i < task->request_count; ++i) {
                 auto* slice = new Slice{};
                 slice->length = task->request[i].length;
-                slice->status = i == 0 ? Slice::SUCCESS : Slice::FAILED;
+                const bool success = requests_seen_++ % 2 == 0;
+                slice->status = success ? Slice::SUCCESS : Slice::FAILED;
+                if (success)
+                    ++task->success_slice_count;
+                else
+                    ++task->failed_slice_count;
                 task->slice_list.push_back(slice);
             }
             if (extra_slice_) task->slice_list.push_back(new Slice{});
@@ -476,8 +479,11 @@ class PartialFailureSubmissionTransport : public BatchResultTransport {
         return Status::InvalidArgument("synthetic submit failure");
     }
 
-    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
-        status.s = TransferStatusEnum::FAILED;
+    Status getTransferStatus(BatchID id, size_t index,
+                             TransferStatus& status) override {
+        const auto& task = toBatchDesc(id).task_list[index];
+        status.s = task.failed_slice_count ? TransferStatusEnum::FAILED
+                                           : TransferStatusEnum::COMPLETED;
         return Status::OK();
     }
 
@@ -489,6 +495,7 @@ class PartialFailureSubmissionTransport : public BatchResultTransport {
 
    private:
     bool extra_slice_ = false;
+    size_t requests_seen_ = 0;
 };
 
 class TerminalFailureTransport : public BatchResultTransport {
@@ -1129,9 +1136,9 @@ TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
     const TransferEngine::ScatterTransferOptions independent_reads{
         .cancel_on_error = false, .busy_poll = true};
     EXPECT_EQ(run(independent_reads), (std::vector<bool>{true, false}));
-    EXPECT_EQ(transport->request_counts, (std::vector<size_t>{2, 2}));
+    EXPECT_EQ(transport->request_counts, (std::vector<size_t>{2, 1, 1}));
     transport->addExtraSlice();
-    EXPECT_EQ(run(independent_reads), (std::vector<bool>{false, false}));
+    EXPECT_EQ(run({}), (std::vector<bool>{false, false}));
 }
 
 TEST_F(TransportTest,

@@ -416,6 +416,18 @@ add_executable(rdma_transport_submit_task_test
                ${WORKSPACE}/rdma_transport_submit_task_test.cpp)
 target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
                                                              gtest gtest_main)
+# --wrap cannot replace references inside an already-linked shared library.
+if(UNIX
+   AND NOT APPLE
+   AND NOT BUILD_SHARED_LIBS)
+  target_compile_definitions(rdma_transport_submit_task_test
+                             PRIVATE MOONCAKE_RDMA_SUBMIT_TEST_HOOKS)
+  target_link_options(
+    rdma_transport_submit_task_test
+    PRIVATE
+    "-Wl,--wrap=_ZN8mooncake11RdmaContext14submitPostSendERKSt6vectorIPNS_9Transport5SliceESaIS4_EE"
+  )
+endif()
 add_test(NAME rdma_transport_submit_task_test
          COMMAND rdma_transport_submit_task_test)
 

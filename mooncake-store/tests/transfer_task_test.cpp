@@ -784,8 +784,8 @@ class ControlledReadTransport : public Transport {
 
     Status submitTransferTask(
         const std::vector<TransferTask*>& tasks) override {
-        next->submitted = tasks.size();
-        next->tasks = tasks;
+        next->submitted += tasks.size();
+        next->tasks.insert(next->tasks.end(), tasks.begin(), tasks.end());
         for (auto* task : tasks) {
             auto* slice = new Slice{};
             slice->source_addr = new std::shared_ptr<Control>(next);

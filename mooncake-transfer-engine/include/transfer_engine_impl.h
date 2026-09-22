@@ -143,8 +143,10 @@ class TransferEngineImpl {
     }
 
     Status submitScatter(const std::vector<TransferRequest>& entries,
-                         MultiTransport::ScatterSubmission& submission) {
-        Status s = multi_transports_->submitScatter(entries, submission);
+                         MultiTransport::ScatterSubmission& submission,
+                         bool independent_requests = false) {
+        Status s = multi_transports_->submitScatter(entries, submission,
+                                                    independent_requests);
 #ifdef WITH_METRICS
         if (metrics_enabled_ && s.ok()) {
             auto& batch = Transport::toBatchDesc(submission.batch_id);

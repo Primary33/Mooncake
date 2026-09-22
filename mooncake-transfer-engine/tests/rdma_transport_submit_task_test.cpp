@@ -22,16 +22,52 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <array>
 #include <string>
 
 #include "config.h"
 #include "multi_transport.h"
 #include "rdma_test_peers.h"
 #include "transfer_metadata.h"
+#include "transfer_engine.h"
+#include "transfer_engine_impl.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
 
 using namespace mooncake;
+
+#ifdef MOONCAKE_RDMA_SUBMIT_TEST_HOOKS
+namespace mooncake {
+class TransferEngineImplTestPeer {
+   public:
+    static void bind(TransferEngine &engine,
+                     const std::shared_ptr<TransferMetadata> &metadata,
+                     const std::shared_ptr<RdmaTransport> &transport) {
+        auto &impl = *engine.impl_;
+        impl.metadata_ = metadata;
+        impl.local_server_name_ = "unit-test-server:1234";
+        impl.multi_transports_ =
+            std::make_shared<MultiTransport>(metadata, impl.local_server_name_);
+        impl.multi_transports_->transport_map_.emplace("rdma", transport);
+    }
+};
+}  // namespace mooncake
+
+static std::vector<void *> posted_sources;
+
+// Exercise actual RDMA slicing, device selection and submission cleanup with
+// synthetic registered ranges. Only posting/completion is replaced; no device
+// is opened and these synthetic addresses must never be dereferenced.
+extern "C" int
+__wrap__ZN8mooncake11RdmaContext14submitPostSendERKSt6vectorIPNS_9Transport5SliceESaIS4_EE(
+    RdmaContext *, const std::vector<Transport::Slice *> &slices) {
+    for (auto *slice : slices) {
+        posted_sources.push_back(slice->source_addr);
+        slice->markSuccess();
+    }
+    return 0;
+}
+#endif
 
 namespace {
 
@@ -43,7 +79,7 @@ class SubmitTransferTaskTest : public ::testing::Test {
     static constexpr uint64_t kBufferAddr = 0x10000;
 
     std::shared_ptr<TransferMetadata> metadata_;
-    std::unique_ptr<RdmaTransport> transport_;
+    std::shared_ptr<RdmaTransport> transport_;
     std::shared_ptr<RdmaContext> context_;
     uint64_t block_size_ = 0;
 
@@ -51,7 +87,7 @@ class SubmitTransferTaskTest : public ::testing::Test {
         block_size_ = globalConfig().slice_size;
 
         metadata_ = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
-        transport_ = std::make_unique<RdmaTransport>();
+        transport_ = std::make_shared<RdmaTransport>();
         RdmaTransportTestPeer::bindMetadata(*transport_, metadata_,
                                             "unit-test-server:1234");
 
@@ -196,4 +232,63 @@ TEST_F(SubmitTransferTaskTest, GroupedRequestsReportFailurePerRequest) {
     EXPECT_EQ(request_statuses, std::vector(2, status.s));
     EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
 }
+
+#ifdef MOONCAKE_RDMA_SUBMIT_TEST_HOOKS
+class IndependentScatterRdmaTest : public SubmitTransferTaskTest {
+   protected:
+    void checkFailureIsolation(bool partially_registered) {
+        TransferEngine engine(false);
+        TransferEngineImplTestPeer::bind(engine, metadata_, transport_);
+        for (size_t bad_index = 0; bad_index < 3; ++bad_index) {
+            SCOPED_TRACE(bad_index);
+            posted_sources.clear();
+            std::array<size_t, 3> lengths{4, 4, 4};
+            std::array<size_t, 1> offsets{0};
+            std::array<size_t, 3> callbacks{};
+            std::array<bool, 3> succeeded{};
+            std::vector<TransferEngine::ScatterTransferRange> ranges;
+            for (size_t i = 0; i < lengths.size(); ++i) {
+                uintptr_t address = kBufferAddr + i * 4;
+                if (i == bad_index) {
+                    address = partially_registered ? kBufferAddr
+                                                   : kBufferAddr + block_size_;
+                    lengths[i] = partially_registered ? 2 * block_size_ : 4;
+                }
+                ranges.push_back({
+                    .opcode = TransferRequest::READ,
+                    .remote_segment = "unit-test-server:1234",
+                    .remote_base_offset = kBufferAddr,
+                    .remote_size = 2 * block_size_,
+                    .local_buffer = reinterpret_cast<void *>(address),
+                    .local_capacity = lengths[i],
+                    .local_offsets = offsets,
+                    .remote_offsets = offsets,
+                    .lengths = std::span<const size_t>(&lengths[i], 1),
+                    .on_fragment_complete =
+                        [&, i](size_t, const Status &status) {
+                            ++callbacks[i];
+                            succeeded[i] = status.ok();
+                        },
+                });
+            }
+            auto operation = engine.submitScatter(
+                ranges, {.cancel_on_error = false, .busy_poll = true});
+            EXPECT_FALSE(operation.wait().ok());
+            EXPECT_EQ(posted_sources.size(), 2u);
+            for (size_t i = 0; i < lengths.size(); ++i) {
+                EXPECT_EQ(callbacks[i], 1u);
+                EXPECT_EQ(succeeded[i], i != bad_index);
+            }
+        }
+    }
+};
+
+TEST_F(IndependentScatterRdmaTest, UnregisteredDestinationDoesNotFailPeers) {
+    checkFailureIsolation(false);
+}
+
+TEST_F(IndependentScatterRdmaTest, PartialRegistrationDoesNotFailPeers) {
+    checkFailureIsolation(true);
+}
+#endif
 }  // namespace

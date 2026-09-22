@@ -79,8 +79,11 @@ template <class T>
 class Slab {
    public:
     static Slab &Get() {
-        static Slab<T> g_slice;
-        return g_slice;
+        // Deferred transfers may still use this storage during static teardown.
+        // Keep the pool alive until process exit; deallocate() still destroys
+        // individual objects and returns their storage for reuse.
+        static Slab<T> *const instance = new Slab<T>();
+        return *instance;
     }
 
    public:

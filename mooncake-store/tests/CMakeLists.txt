@@ -161,6 +161,13 @@ add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 if(USE_TENT)
+  add_store_test(batch_read_tent_shutdown_test
+                 batch_read_tent_shutdown_test.cpp)
+  add_test(NAME batch_read_tent_subbatch_shutdown_test
+           COMMAND batch_read_tent_shutdown_test --slab-subbatch)
+  set_tests_properties(
+    batch_read_tent_shutdown_test batch_read_tent_subbatch_shutdown_test
+    PROPERTIES TIMEOUT 20 ENVIRONMENT "MC_USE_TENT=1;MC_FORCE_TCP=1")
   add_test(
     NAME batch_get_tent_test
     COMMAND
