@@ -933,14 +933,71 @@ TransferStrategy TransferFuture::strategy() const {
     return state_->get_strategy();
 }
 
+// Reserve reclamation capacity before submitting work: once a read is in flight
+// we must be able to retain it, even if it never physically completes. One
+// worker polls every deferred operation without letting a stuck batch block the
+// rest.
+class BatchReadOperation::Reclaimer {
+   public:
+    static Reclaimer& instance() {
+        static Reclaimer reclaimer;
+        return reclaimer;
+    }
+
+    struct Reservation {
+        Reservation() {
+            auto& count = instance().outstanding_;
+            size_t value = count.load(std::memory_order_relaxed);
+            while (value < kMaxOutstanding) {
+                if (count.compare_exchange_weak(value, value + 1,
+                                                std::memory_order_relaxed)) {
+                    counter = &count;
+                    break;
+                }
+            }
+        }
+        ~Reservation() { release(); }
+        void release() {
+            if (counter) {
+                counter->fetch_sub(1, std::memory_order_relaxed);
+                counter = nullptr;
+            }
+        }
+        Reservation(const Reservation&) = delete;
+        Reservation& operator=(const Reservation&) = delete;
+        std::atomic<size_t>* counter = nullptr;
+    };
+
+    void defer(std::unique_ptr<Impl> operation);
+
+   private:
+    static constexpr size_t kMaxOutstanding = 4096;
+    Reclaimer();
+    ~Reclaimer();
+    void run();
+
+    std::atomic<size_t> outstanding_{0};
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::unique_ptr<Impl> pending_;
+    bool stopping_ = false;
+    std::thread worker_;
+};
+
 class BatchReadOperation::Impl {
    public:
     Impl(TransferEngine& engine,
          const std::vector<Replica::Descriptor>& replicas,
          const std::vector<std::vector<Slice>>& all_slices,
-         TransferMetric* metric)
-        : results_(replicas.size(), ErrorCode::TRANSFER_FAIL) {
+         TransferMetric* metric, std::chrono::milliseconds timeout)
+        : results_(replicas.size(), ErrorCode::TRANSFER_FAIL),
+          remaining_(replicas.size(), 0),
+          timeout_results_(replicas.size(), ErrorCode::TRANSFER_FAIL) {
         if (replicas.size() != all_slices.size()) return;
+        if (!reservation_.counter) {
+            LOG(ERROR) << "Too many outstanding batch reads";
+            return;
+        }
 
         size_t fragment_count = 0;
         for (const auto& slices : all_slices) fragment_count += slices.size();
@@ -963,6 +1020,7 @@ class BatchReadOperation::Impl {
             uint64_t offset = 0;
             for (const auto& slice : slices) {
                 if (slice.size == 0) continue;
+                ++remaining_[i];
                 const size_t index = lengths_.size();
                 remote_offsets_.push_back(static_cast<size_t>(offset));
                 lengths_.push_back(slice.size);
@@ -980,6 +1038,7 @@ class BatchReadOperation::Impl {
                     .lengths = std::span<const size_t>(&lengths_[index], 1),
                     .on_fragment_complete =
                         [this, i](size_t, const Status& status) {
+                            --remaining_[i];
                             if (!status.ok())
                                 results_[i] = ErrorCode::TRANSFER_FAIL;
                         },
@@ -993,6 +1052,15 @@ class BatchReadOperation::Impl {
         options.cancel_on_error = false;
         options.busy_poll = true;
         operation_.emplace(engine.submitScatter(ranges, options));
+        // Match TransferEngineOperationState: the budget starts after submit,
+        // not when this operation eventually reaches the caller's wait loop.
+        const auto now = std::chrono::steady_clock::now();
+        const auto max_timeout =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::time_point::max() - now);
+        deadline_ = timeout >= max_timeout
+                        ? std::chrono::steady_clock::time_point::max()
+                        : now + std::max(timeout, std::chrono::milliseconds(0));
         if (metric) {
             for (size_t i = 0; i < results_.size(); ++i) {
                 // Synchronous preparation failures have already invoked their
@@ -1006,14 +1074,18 @@ class BatchReadOperation::Impl {
         }
     }
 
-    const std::vector<ErrorCode>& wait() {
-        if (operation_) (void)operation_->wait();
-        // A batch-level error must not overwrite independently completed keys.
-        // The scatter callbacks provide the result of every submitted fragment.
-        return results_;
+    bool wait() {
+        if (operation_ &&
+            operation_->waitFor(deadline_ - std::chrono::steady_clock::now())
+                .IsClock())
+            return false;
+        reservation_.release();
+        return true;
     }
 
    private:
+    friend class BatchReadOperation;
+    friend class Reclaimer;
     static bool validObject(const AllocatedBuffer::Descriptor& handle,
                             const std::vector<Slice>& slices) {
         if (handle.transport_endpoint_.empty() || handle.size_ == 0 ||
@@ -1030,13 +1102,78 @@ class BatchReadOperation::Impl {
         return total == handle.size_;
     }
 
+    // Release the reservation last, after destroying all transfer state.
+    Reclaimer::Reservation reservation_;
+    std::unique_ptr<Impl> next_deferred_;
     std::vector<ErrorCode> results_;
+    std::vector<size_t> remaining_;
+    // Preallocate the timeout snapshot so handing off cannot allocate memory.
+    std::vector<ErrorCode> timeout_results_;
+    std::chrono::steady_clock::time_point deadline_;
     std::vector<size_t> zero_offsets_;
     std::vector<size_t> remote_offsets_;
     std::vector<size_t> lengths_;
     // Declared last: drain before destroying callback targets or range storage.
     std::optional<TransferEngine::ScatterTransferOperation> operation_;
 };
+
+BatchReadOperation::Reclaimer::Reclaimer() : worker_([this] { run(); }) {}
+
+BatchReadOperation::Reclaimer::~Reclaimer() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+    }
+    cv_.notify_one();
+    worker_.join();
+    // Process shutdown must not wait forever or destroy state still referenced
+    // by a transport. Quarantine the bounded remainder, retaining its backend
+    // owners too. The OS reclaims it on exit; normal completion reclaims
+    // inline.
+    while (pending_) {
+        auto next = std::move(pending_->next_deferred_);
+        (void)pending_.release();
+        pending_ = std::move(next);
+    }
+}
+
+void BatchReadOperation::Reclaimer::defer(std::unique_ptr<Impl> operation) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        operation->next_deferred_ = std::move(pending_);
+        pending_ = std::move(operation);
+    }
+    cv_.notify_one();
+}
+
+void BatchReadOperation::Reclaimer::run() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (true) {
+        cv_.wait(lock, [this] { return stopping_ || pending_; });
+        if (stopping_) return;
+        auto pending = std::move(pending_);
+        lock.unlock();
+        std::unique_ptr<Impl> unfinished;
+        Impl* tail = nullptr;
+        while (pending) {
+            auto operation = std::move(pending);
+            pending = std::move(operation->next_deferred_);
+            if (operation->operation_->waitFor(std::chrono::nanoseconds(0))
+                    .IsClock()) {
+                if (!tail) tail = operation.get();
+                operation->next_deferred_ = std::move(unfinished);
+                unfinished = std::move(operation);
+            }
+        }
+        lock.lock();
+        if (tail) {
+            tail->next_deferred_ = std::move(pending_);
+            pending_ = std::move(unfinished);
+        }
+        cv_.wait_for(lock, std::chrono::milliseconds(1),
+                     [this] { return stopping_; });
+    }
+}
 
 BatchReadOperation::BatchReadOperation(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
@@ -1047,7 +1184,18 @@ BatchReadOperation& BatchReadOperation::operator=(
 BatchReadOperation::~BatchReadOperation() = default;
 
 const std::vector<ErrorCode>& BatchReadOperation::wait() {
-    return impl_->wait();
+    if (!impl_) return timeout_results_;
+    if (impl_->wait()) return impl_->results_;
+    LOG(ERROR) << "Batch read transfer wait timed out; retaining unfinished "
+                  "transfer state for deferred reclamation";
+    for (size_t i = 0; i < impl_->results_.size(); ++i) {
+        impl_->timeout_results_[i] = impl_->remaining_[i] == 0
+                                         ? impl_->results_[i]
+                                         : ErrorCode::TRANSFER_FAIL;
+    }
+    timeout_results_ = std::move(impl_->timeout_results_);
+    Reclaimer::instance().defer(std::move(impl_));
+    return timeout_results_;
 }
 
 // ============================================================================
@@ -1218,9 +1366,10 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
 
 BatchReadOperation TransferSubmitter::submitBatchRead(
     const std::vector<Replica::Descriptor>& replicas,
-    const std::vector<std::vector<Slice>>& all_slices) {
+    const std::vector<std::vector<Slice>>& all_slices,
+    std::chrono::milliseconds timeout) {
     return BatchReadOperation(std::make_unique<BatchReadOperation::Impl>(
-        engine_, replicas, all_slices, transfer_metric_));
+        engine_, replicas, all_slices, transfer_metric_, timeout));
 }
 
 TransferEngine::ScatterTransferOperation TransferSubmitter::submitScatter(

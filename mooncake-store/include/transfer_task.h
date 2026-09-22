@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -524,9 +525,10 @@ class FilereadWorkerPool {
     std::shared_ptr<StorageBackend> backend_;
 };
 
-// A single-consumer batch of independent remote memory reads. Destruction
-// drains outstanding transfers; callers must keep destination buffers alive
-// until wait() returns or the operation is destroyed.
+// A single-consumer batch of independent remote memory reads. wait() has a
+// submission-relative timeout and hands unfinished internal state to a reaper.
+// As with TransferFuture, a timeout does not cancel access to caller buffers.
+// Destruction without wait() still drains outstanding transfers.
 class BatchReadOperation {
    public:
     BatchReadOperation(BatchReadOperation&&) noexcept;
@@ -540,8 +542,10 @@ class BatchReadOperation {
 
    private:
     class Impl;
+    class Reclaimer;
     explicit BatchReadOperation(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
+    std::vector<ErrorCode> timeout_results_;
     friend class TransferSubmitter;
 };
 
@@ -593,10 +597,12 @@ class TransferSubmitter {
         TransferRequest::OpCode op_code);
 
     // Unlike submit_batch(), retains one result per object. Local memcpy and
-    // non-memory replicas should continue through submit().
+    // non-memory replicas should continue through submit(). The timeout budget
+    // starts after submission and is not renewed by wait().
     BatchReadOperation submitBatchRead(
         const std::vector<Replica::Descriptor>& replicas,
-        const std::vector<std::vector<Slice>>& all_slices);
+        const std::vector<std::vector<Slice>>& all_slices,
+        std::chrono::milliseconds timeout = std::chrono::seconds(60));
 
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,

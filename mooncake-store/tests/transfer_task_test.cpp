@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <barrier>
 #include <chrono>
@@ -17,11 +18,28 @@
 
 #include "types.h"
 #include "pinned_buffer_pool.h"
+#include "multi_transport.h"
+#include "transfer_engine_impl.h"
 #if defined(USE_CUDA) || defined(MOONCAKE_TEST_CUDA_H2D)
 #include <cuda_runtime_api.h>
 #endif
 
 namespace mooncake {
+
+class TransferEngineImplTestPeer {
+   public:
+    static void installTestTransport(TransferEngine& engine,
+                                     std::shared_ptr<Transport> transport) {
+        auto& impl = *engine.impl_;
+        impl.multi_transports_->transport_map_.clear();
+        impl.multi_transports_->transport_map_.emplace("controlled", transport);
+        auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+        descriptor->name = "controlled-remote";
+        descriptor->protocol = "controlled";
+        impl.getMetadata()->addLocalSegment(12, "controlled-remote",
+                                            std::move(descriptor));
+    }
+};
 
 // Test fixture for TransferTask tests
 // TODO: Currently, this test does not cover TransferSubmitter and
@@ -735,6 +753,313 @@ TEST_F(BatchReadTest, ConcurrentBatchesAndSingleReadsShareRemoteHandle) {
     for (auto& reader : readers) reader.join();
     EXPECT_EQ(failures.load(), 0u);
     EXPECT_EQ(client_->unregisterLocalMemory(destinations.data()), 0);
+}
+
+// The transport deliberately borrows task.request, as classic transports do.
+// Reading it after a timeout exercises the lifetime of Scatter's request array,
+// while the fragment callbacks exercise the Store operation's captured `this`.
+class ControlledReadTransport : public Transport {
+   public:
+    struct Control {
+        std::vector<TransferStatusEnum> statuses;
+        std::atomic<bool> finish{false};
+        std::atomic<size_t> reclaimed{0};
+        size_t submitted = 0;
+        bool hold_physical_completion = false;
+        std::vector<TransferTask*> tasks;
+
+        void finishPhysical() {
+            // Match the completion publication used by Transport::Slice.
+            for (auto* task : tasks)
+                __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
+        }
+    };
+
+    std::shared_ptr<Control> next;
+
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest>&) override {
+        return Status::InvalidArgument("use task submission");
+    }
+
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        next->submitted = tasks.size();
+        next->tasks = tasks;
+        for (auto* task : tasks) {
+            auto* slice = new Slice{};
+            slice->source_addr = new std::shared_ptr<Control>(next);
+            slice->cleanup_callback = [](Slice* slice) {
+                auto* owner =
+                    static_cast<std::shared_ptr<Control>*>(slice->source_addr);
+                (*owner)->reclaimed.fetch_add(1);
+                delete owner;
+            };
+            task->slice_list.push_back(slice);
+        }
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID id, size_t index,
+                             TransferStatus& status) override {
+        auto& task = toBatchDesc(id).task_list[index];
+        auto control = *static_cast<std::shared_ptr<Control>*>(
+            task.slice_list[0]->source_addr);
+        const auto initial = control->statuses.at(index);
+        status.s =
+            control->finish.load() && initial != TransferStatusEnum::FAILED
+                ? TransferStatusEnum::COMPLETED
+                : initial;
+        if (status.s == TransferStatusEnum::COMPLETED) {
+            const auto& request = *task.request;
+            std::memcpy(request.source,
+                        reinterpret_cast<void*>(request.target_offset),
+                        request.length);
+            status.transferred_bytes = request.length;
+            task.is_finished = true;
+        } else if (status.s == TransferStatusEnum::FAILED &&
+                   !control->hold_physical_completion) {
+            task.is_finished = true;
+        }
+        return Status::OK();
+    }
+
+    const char* getName() const override { return "controlled"; }
+
+   private:
+    int registerLocalMemory(void*, size_t, const std::string&, bool,
+                            bool) override {
+        return 0;
+    }
+    int unregisterLocalMemory(void*, bool) override { return 0; }
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
+                                 const std::string&) override {
+        return 0;
+    }
+    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
+        return 0;
+    }
+};
+
+class BatchReadTimeoutTest : public TransferTaskTest {
+   protected:
+    void SetUp() override {
+        TransferTaskTest::SetUp();
+        engine_ = std::make_unique<TransferEngine>(false);
+        ASSERT_FALSE(engine_->isUsingTent());
+        ASSERT_EQ(engine_->init("P2PHANDSHAKE", "127.0.0.1:0"), 0);
+        transport_ = std::make_shared<ControlledReadTransport>();
+        TransferEngineImplTestPeer::installTestTransport(*engine_, transport_);
+        submitter_ = std::make_unique<TransferSubmitter>(
+            *engine_, backend_, engine_->getLocalIpAndPort());
+    }
+
+    void TearDown() override {
+        for (const auto& control : controls_) {
+            if (control->hold_physical_completion &&
+                control->reclaimed.load() == 0)
+                control->finishPhysical();
+            control->finish = true;
+        }
+        for (const auto& control : controls_) EXPECT_TRUE(Reclaimed(control));
+        submitter_.reset();
+        engine_.reset();
+        transport_.reset();
+        TransferTaskTest::TearDown();
+    }
+
+    std::shared_ptr<ControlledReadTransport::Control> Prepare(
+        std::vector<TransferStatusEnum> statuses) {
+        auto control = std::make_shared<ControlledReadTransport::Control>();
+        control->statuses = std::move(statuses);
+        transport_->next = control;
+        controls_.push_back(control);
+        return control;
+    }
+
+    BatchReadOperation Submit(std::chrono::milliseconds timeout,
+                              bool split_last = false) {
+        std::vector<Replica::Descriptor> replicas;
+        std::vector<std::vector<Slice>> slices;
+        for (size_t i = 0; i < source_.size(); ++i) {
+            MemoryDescriptor memory;
+            memory.buffer_descriptor.buffer_address_ =
+                reinterpret_cast<uintptr_t>(&source_[i]);
+            memory.buffer_descriptor.size_ = sizeof(source_[i]);
+            memory.buffer_descriptor.transport_endpoint_ = "controlled-remote";
+            Replica::Descriptor replica;
+            replica.descriptor_variant = memory;
+            replica.status = ReplicaStatus::COMPLETE;
+            replicas.push_back(std::move(replica));
+            auto* dest = reinterpret_cast<char*>(&destination_[i]);
+            if (split_last && i + 1 == source_.size())
+                slices.push_back({{dest, 1}, {dest + 1, 1}});
+            else
+                slices.push_back({{dest, sizeof(destination_[i])}});
+        }
+        return submitter_->submitBatchRead(replicas, slices, timeout);
+    }
+
+    static bool Reclaimed(
+        const std::shared_ptr<ControlledReadTransport::Control>& control) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (control->reclaimed.load() != control->submitted &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return control->reclaimed.load() == control->submitted;
+    }
+
+    ScopedEnvVar use_tent_{"MC_USE_TENT", nullptr};
+    ScopedEnvVar use_tev1_{"MC_USE_TEV1", nullptr};
+    std::array<uint16_t, 4> source_{11, 22, 33, 44};
+    std::array<uint16_t, 4> destination_{};
+    std::unique_ptr<TransferEngine> engine_;
+    std::shared_ptr<ControlledReadTransport> transport_;
+    std::shared_ptr<StorageBackend> backend_;
+    std::unique_ptr<TransferSubmitter> submitter_;
+    std::vector<std::shared_ptr<ControlledReadTransport::Control>> controls_;
+};
+
+TEST_F(BatchReadTimeoutTest, TimeoutPreservesResultsAndRetainsBorrowedState) {
+    auto control =
+        Prepare({TransferStatusEnum::COMPLETED, TransferStatusEnum::WAITING,
+                 TransferStatusEnum::FAILED, TransferStatusEnum::COMPLETED,
+                 TransferStatusEnum::TIMEOUT});
+    auto operation = Submit(std::chrono::milliseconds(0), true);
+    const auto begin = std::chrono::steady_clock::now();
+    const auto& results = operation.wait();
+    const std::vector<ErrorCode> expected{
+        ErrorCode::OK, ErrorCode::TRANSFER_FAIL, ErrorCode::TRANSFER_FAIL,
+        ErrorCode::TRANSFER_FAIL};
+    EXPECT_EQ(results, expected);
+    EXPECT_EQ(control->reclaimed.load(), 0);
+    EXPECT_LT(std::chrono::steady_clock::now() - begin,
+              std::chrono::seconds(1));
+    // The facade may disappear while the backend and borrowed request storage
+    // must remain alive. No caller buffer is freed until physical completion.
+    submitter_.reset();
+    engine_.reset();
+    control->finish = true;
+    ASSERT_TRUE(Reclaimed(control));
+    EXPECT_EQ(results, expected);
+    EXPECT_EQ(operation.wait(), expected);
+    EXPECT_EQ(destination_[0], source_[0]);
+    EXPECT_EQ(destination_[1], source_[1]);
+    EXPECT_EQ(destination_[2], 0);
+    EXPECT_EQ(destination_[3], source_[3]);
+}
+
+TEST_F(BatchReadTimeoutTest, DestructionAfterTimeoutDoesNotWaitAgain) {
+    auto control = Prepare(
+        std::vector<TransferStatusEnum>(4, TransferStatusEnum::WAITING));
+    const auto begin = std::chrono::steady_clock::now();
+    {
+        auto operation = Submit(std::chrono::milliseconds(0));
+        EXPECT_EQ(operation.wait(),
+                  std::vector<ErrorCode>(4, ErrorCode::TRANSFER_FAIL));
+    }
+    EXPECT_LT(std::chrono::steady_clock::now() - begin,
+              std::chrono::seconds(1));
+    EXPECT_EQ(control->reclaimed.load(), 0);
+    control->finish = true;
+    ASSERT_TRUE(Reclaimed(control));
+    EXPECT_EQ(destination_, source_);
+}
+
+TEST_F(BatchReadTimeoutTest, TerminalFailureStillRespectsBatchBusy) {
+    auto control =
+        Prepare(std::vector<TransferStatusEnum>(4, TransferStatusEnum::FAILED));
+    control->hold_physical_completion = true;
+    {
+        auto operation = Submit(std::chrono::milliseconds(0));
+        EXPECT_EQ(operation.wait(),
+                  std::vector<ErrorCode>(4, ErrorCode::TRANSFER_FAIL));
+    }
+    EXPECT_EQ(control->reclaimed.load(), 0);
+    control->finishPhysical();
+    ASSERT_TRUE(Reclaimed(control));
+}
+
+TEST_F(BatchReadTimeoutTest, DeadlineIsNotRestartedBySequentialWaits) {
+    auto first_control = Prepare(
+        std::vector<TransferStatusEnum>(4, TransferStatusEnum::WAITING));
+    auto first = Submit(std::chrono::milliseconds(600));
+    auto second_control = Prepare(
+        std::vector<TransferStatusEnum>(4, TransferStatusEnum::WAITING));
+    auto second = Submit(std::chrono::milliseconds(600));
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    const auto begin = std::chrono::steady_clock::now();
+    EXPECT_EQ(first.wait(),
+              std::vector<ErrorCode>(4, ErrorCode::TRANSFER_FAIL));
+    EXPECT_EQ(second.wait(),
+              std::vector<ErrorCode>(4, ErrorCode::TRANSFER_FAIL));
+    EXPECT_LT(std::chrono::steady_clock::now() - begin,
+              std::chrono::milliseconds(300));
+    first_control->finish = true;
+    ASSERT_TRUE(Reclaimed(first_control));
+    second_control->finish = true;
+    ASSERT_TRUE(Reclaimed(second_control));
+}
+
+TEST_F(BatchReadTimeoutTest, WaitUsesTheRemainingBudget) {
+    auto control = Prepare(
+        std::vector<TransferStatusEnum>(4, TransferStatusEnum::WAITING));
+    const auto begin = std::chrono::steady_clock::now();
+    auto operation = Submit(std::chrono::milliseconds(120));
+    EXPECT_EQ(operation.wait(),
+              std::vector<ErrorCode>(4, ErrorCode::TRANSFER_FAIL));
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    EXPECT_GE(elapsed, std::chrono::milliseconds(100));
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+    control->finish = true;
+    ASSERT_TRUE(Reclaimed(control));
+}
+
+TEST_F(BatchReadTimeoutTest, StuckReadDoesNotBlockReclaimingAnotherRead) {
+    auto ready = Prepare(
+        std::vector<TransferStatusEnum>(4, TransferStatusEnum::WAITING));
+    auto first = Submit(std::chrono::milliseconds(0));
+    first.wait();
+    auto stuck = Prepare(
+        std::vector<TransferStatusEnum>(4, TransferStatusEnum::TIMEOUT));
+    auto second = Submit(std::chrono::milliseconds(0));
+    second.wait();
+    ready->finish = true;
+    EXPECT_TRUE(Reclaimed(ready));
+    EXPECT_EQ(stuck->reclaimed.load(), 0);
+    stuck->finish = true;
+    ASSERT_TRUE(Reclaimed(stuck));
+}
+
+TEST_F(BatchReadTimeoutTest, ReclamationCapacityIsReservedBeforeSubmission) {
+    std::vector<BatchReadOperation> operations;
+    // Exceed the process-wide 4096-operation retention budget without actually
+    // timing out thousands of operations or allocating unbounded state.
+    operations.reserve(4096);
+    for (size_t i = 0; i < 4096; ++i) {
+        Prepare(
+            std::vector<TransferStatusEnum>(4, TransferStatusEnum::WAITING));
+        operations.push_back(Submit(std::chrono::milliseconds(0)));
+        ASSERT_EQ(controls_.back()->submitted, 4);
+    }
+    auto rejected = Prepare(
+        std::vector<TransferStatusEnum>(4, TransferStatusEnum::WAITING));
+    EXPECT_EQ(Submit(std::chrono::milliseconds(0)).wait(),
+              std::vector<ErrorCode>(4, ErrorCode::TRANSFER_FAIL));
+    EXPECT_EQ(rejected->submitted, 0);
+    // Completed operations release their reservation even if the caller keeps
+    // the result object alive. New work can then proceed.
+    for (size_t i = 0; i < operations.size(); ++i) {
+        controls_[i]->finish = true;
+        EXPECT_EQ(operations[i].wait(),
+                  std::vector<ErrorCode>(4, ErrorCode::OK));
+    }
+    auto accepted = Prepare(
+        std::vector<TransferStatusEnum>(4, TransferStatusEnum::COMPLETED));
+    EXPECT_EQ(Submit(std::chrono::milliseconds(0)).wait(),
+              std::vector<ErrorCode>(4, ErrorCode::OK));
+    EXPECT_EQ(accepted->submitted, 4);
 }
 
 // Test TransferStrategy enum and stream operator
